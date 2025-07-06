@@ -30,7 +30,7 @@ async def admin_message(update, context):
         await update.message.reply_text("Режим администратора: подключение к базе данных выполнено.")
         # После успешного подключения выводим меню действий
         await update.message.reply_text(
-            "Выберите действие:\n1. Показать весь список.\n2. Найти по фамилии.\n3. Добавить данные.\n4. Удалить данные.\nВведите номер действия:")
+            "Выберите действие:\n1. Показать весь список.\n2. Найти по фамилии.\n3. Редактировать данные.\n4. Добавить данные.\n5. Удалить данные.\nВведите номер действия:")
         # Сохраняем состояние ожидания выбора действия
         context.user_data['admin_mode'] = True
     else:
@@ -42,7 +42,12 @@ async def admin_action_handler(update, context):
         return
     from db.work_db import WorkDB
     work_db = WorkDB()
-    await work_db.handle_admin_action(update, context)
+    if context.user_data.get('awaiting_surname'):
+        # Поиск по второму полю (например, фамилия)
+        context.user_data['awaiting_surname'] = False
+        await work_db.search_by_second_field(update, context)
+    else:
+        await work_db.handle_admin_action(update, context)
 
 def main():
     # Создаем экземпляр приложения
