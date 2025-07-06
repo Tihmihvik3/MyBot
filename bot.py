@@ -41,19 +41,8 @@ async def admin_action_handler(update, context):
     if not context.user_data.get('admin_mode'):
         return
     from db.work_db import WorkDB
-    text = update.message.text.strip()
     work_db = WorkDB()
-    if text == '1':
-        await update.message.reply_text("Показать весь список (реализация позже)")
-    elif text == '2':
-        await update.message.reply_text("Введите фамилию для поиска:")
-        context.user_data['awaiting_surname'] = True
-    elif text == '3':
-        await update.message.reply_text("Введите данные для добавления (реализация позже)")
-    elif text == '4':
-        await update.message.reply_text("Введите данные для удаления (реализация позже)")
-    else:
-        await update.message.reply_text("Некорректный выбор. Введите номер действия от 1 до 4.")
+    await work_db.handle_admin_action(update, context)
 
 def main():
     # Создаем экземпляр приложения
