@@ -1,6 +1,8 @@
 from telegram.ext import Application, MessageHandler, CommandHandler, filters
 import settings
 import logging
+from db.models import User
+
 
 logging.basicConfig(filename='bot.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -20,6 +22,39 @@ async def contact_message(update, context):
     # Ответ на сообщение "контакты"
     await update.message.reply_text("Контакты: Вы можете связаться с нами по телефону +7 (123) 456-78-90 или email example@example.com.")
 
+async def admin_message(update, context):
+    # Обработчик для запроса "админ"
+    from db.database import Database
+    db = Database()
+    if db.connection:
+        await update.message.reply_text("Режим администратора: подключение к базе данных выполнено.")
+        # После успешного подключения выводим меню действий
+        await update.message.reply_text(
+            "Выберите действие:\n1. Показать весь список.\n2. Найти по фамилии.\n3. Добавить данные.\n4. Удалить данные.\nВведите номер действия:")
+        # Сохраняем состояние ожидания выбора действия
+        context.user_data['admin_mode'] = True
+    else:
+        await update.message.reply_text("Ошибка: база данных не найдена.")
+
+async def admin_action_handler(update, context):
+    # Обработчик выбора действия админа
+    if not context.user_data.get('admin_mode'):
+        return
+    from db.work_db import WorkDB
+    text = update.message.text.strip()
+    work_db = WorkDB()
+    if text == '1':
+        await update.message.reply_text("Показать весь список (реализация позже)")
+    elif text == '2':
+        await update.message.reply_text("Введите фамилию для поиска:")
+        context.user_data['awaiting_surname'] = True
+    elif text == '3':
+        await update.message.reply_text("Введите данные для добавления (реализация позже)")
+    elif text == '4':
+        await update.message.reply_text("Введите данные для удаления (реализация позже)")
+    else:
+        await update.message.reply_text("Некорректный выбор. Введите номер действия от 1 до 4.")
+
 def main():
     # Создаем экземпляр приложения
     application = Application.builder().token(settings.API_KEY).build()
@@ -36,10 +71,15 @@ def main():
     # Добавляем обработчик сообщений с фильтром на текст "контакты"
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'(?i)контакты'), contact_message))
 
+    # Добавляем обработчик сообщений с фильтром на текст "админ"
+    application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'(?i)админ'), admin_message))
+    # Добавляем обработчик для выбора действия админа
+    application.add_handler(MessageHandler(filters.TEXT & (~filters.Regex(r'(?i)админ')), admin_action_handler))
+
     logging.info("Бот стартовал")
 
     # Запускаем бота
     application.run_polling()
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
