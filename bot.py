@@ -9,7 +9,8 @@ logging.basicConfig(filename='bot.log', level=logging.INFO, format='%(asctime)s 
 
 async def start_command(update, context):
     # Ответ на команду /start с кнопками
-    keyboard = [["Новости", "Фото"], ["Видео", "Контакты"], ["Справка"]]
+    keyboard = [["1", "2", "3", "4", "5", "6", "7", "8", "9"],
+               ["Новости", "Фото"], ["Видео", "Контакты"], ["Справка"]]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     await update.message.reply_text(
         "Добро пожаловать! Я бот Анжеро-Судженской МО ВОС. Чем могу помочь?",
@@ -46,6 +47,7 @@ async def admin_action_handler(update, context):
     # Обработчик выбора действия админа
     if not context.user_data.get('admin_mode'):
         return
+    # Импорт и создание WorkDB только если активен режим администратора
     from db.work_db import WorkDB
     work_db = WorkDB()
     if context.user_data.get('awaiting_surname'):
@@ -63,6 +65,10 @@ async def photo_message(update, context):
 
 async def video_message(update, context):
     await update.message.reply_text("Видео: Здесь будут опубликованы видеоматериалы.")
+
+async def number_message(update, context):
+    number = update.message.text.strip()
+    await update.message.reply_text(f"Вы нажали кнопку: {number}")
 
 def main():
     # Создаем экземпляр приложения
@@ -87,6 +93,9 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'(?i)новости'), news_message))
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'(?i)фото'), photo_message))
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'(?i)видео'), video_message))
+    # Обработчики для цифровых кнопок 1-9
+    for i in range(1, 10):
+        application.add_handler(MessageHandler(filters.TEXT & filters.Regex(fr'^\s*{i}\s*$'), number_message))
 
     logging.info("Бот стартовал")
 
