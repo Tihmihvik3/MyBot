@@ -1,3 +1,4 @@
+from telegram import ReplyKeyboardMarkup
 from telegram.ext import Application, MessageHandler, CommandHandler, filters
 import settings
 import logging
@@ -7,8 +8,13 @@ from db.models import User
 logging.basicConfig(filename='bot.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 async def start_command(update, context):
-    # Ответ на команду /start
-    await update.message.reply_text("Добро пожаловать! Я бот Анжеро-Судженской МО ВОС. Чем могу помочь?")
+    # Ответ на команду /start с кнопками
+    keyboard = [["Новости", "Фото"], ["Видео", "Контакты"], ["Справка"]]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    await update.message.reply_text(
+        "Добро пожаловать! Я бот Анжеро-Судженской МО ВОС. Чем могу помочь?",
+        reply_markup=reply_markup
+    )
 
 async def greet_user(update, context):
     # Ответ на приветствие
@@ -49,6 +55,15 @@ async def admin_action_handler(update, context):
     else:
         await work_db.handle_admin_action(update, context)
 
+async def news_message(update, context):
+    await update.message.reply_text("Новости: Здесь будут последние новости организации.")
+
+async def photo_message(update, context):
+    await update.message.reply_text("Фото: Здесь будут опубликованы фотографии мероприятий.")
+
+async def video_message(update, context):
+    await update.message.reply_text("Видео: Здесь будут опубликованы видеоматериалы.")
+
 def main():
     # Создаем экземпляр приложения
     application = Application.builder().token(settings.API_KEY).build()
@@ -69,6 +84,9 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'(?i)админ'), admin_message))
     # Добавляем обработчик для выбора действия админа
     application.add_handler(MessageHandler(filters.TEXT & (~filters.Regex(r'(?i)админ')), admin_action_handler))
+    application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'(?i)новости'), news_message))
+    application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'(?i)фото'), photo_message))
+    application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'(?i)видео'), video_message))
 
     logging.info("Бот стартовал")
 
