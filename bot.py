@@ -47,9 +47,30 @@ async def admin_action_handler(update, context):
     # Обработчик выбора действия админа
     if not context.user_data.get('admin_mode'):
         return
-    # Импорт и создание WorkDB только если активен режим администратора
     from db.work_db import WorkDB
+    from db.edit_db import EditDB
     work_db = WorkDB()
+    edit_db = EditDB()
+    if context.user_data.get('editdb_awaiting_surname'):
+        # Ожидание ввода фамилии для поиска в режиме редактирования
+        await edit_db.handle_surname_search(update, context)
+        return
+    if context.user_data.get('editdb_awaiting_choice'):
+        # Ожидание выбора нужной записи из списка
+        await edit_db.handle_choose_result(update, context)
+        return
+    if context.user_data.get('editdb_awaiting_field'):
+        # Ожидание выбора поля для редактирования
+        await edit_db.handle_field_edit(update, context)
+        return
+    if context.user_data.get('editdb_awaiting_new_value'):
+        # Ожидание ввода нового значения для редактируемого поля
+        await edit_db.handle_new_value(update, context)
+        return
+    if context.user_data.get('editdb_continue_or_exit'):
+        # Ожидание выбора продолжить/выход
+        await edit_db.handle_continue_or_exit(update, context)
+        return
     if context.user_data.get('awaiting_surname'):
         # Поиск по второму полю (например, фамилия)
         context.user_data['awaiting_surname'] = False

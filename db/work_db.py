@@ -1,4 +1,5 @@
 from db.database import Database
+from db.edit_db import EditDB
 
 class WorkDB:
     def __init__(self):
@@ -34,7 +35,9 @@ class WorkDB:
             await update.message.reply_text("Введите фамилию для поиска:")
             context.user_data['awaiting_surname'] = True
         elif text == '3':
-            await update.message.reply_text("Редактировать данные (реализация позже)")
+            # Запуск поиска фамилии для редактирования через EditDB
+            edit_db = EditDB()
+            await edit_db.search_and_show_fields(update, context)
         elif text == '4':
             await update.message.reply_text("Введите данные для добавления (реализация позже)")
         elif text == '5':
