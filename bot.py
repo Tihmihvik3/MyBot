@@ -50,35 +50,44 @@ async def admin_action_handler(update, context):
     from db.work_db import WorkDB
     from db.edit_db import EditDB
     from db.add_record import AddRecord
+    from db.del_record import DelRecord
     work_db = WorkDB()
     edit_db = EditDB()
     add_record = AddRecord()
+    del_record = DelRecord()
+    # --- DelRecord этапы ---
+    if context.user_data.get('delrecord_awaiting_surname'):
+        await del_record.handle_surname_search(update, context)
+        return
+    if context.user_data.get('delrecord_awaiting_choice'):
+        await del_record.handle_choose_result(update, context)
+        return
+    if context.user_data.get('delrecord_awaiting_confirm'):
+        await del_record.handle_confirm(update, context)
+        return
+    if context.user_data.get('delrecord_repeat_or_exit'):
+        await del_record.handle_repeat_or_exit(update, context)
+        return
     if context.user_data.get('editdb_awaiting_surname'):
-        # Ожидание ввода фамилии для поиска в режиме редактирования
         await edit_db.handle_surname_search(update, context)
         return
     if context.user_data.get('editdb_awaiting_choice'):
-        # Ожидание выбора нужной записи из списка
         await edit_db.handle_choose_result(update, context)
         return
     if context.user_data.get('editdb_awaiting_field'):
-        # Ожидание выбора поля для редактирования
         await edit_db.handle_field_edit(update, context)
         return
     if context.user_data.get('editdb_awaiting_new_value'):
-        # Ожидание ввода нового значения для редактируемого поля
         await edit_db.handle_new_value(update, context)
         return
     if context.user_data.get('editdb_continue_or_exit'):
-        # Ожидание выбора продолжить/выход
         await edit_db.handle_continue_or_exit(update, context)
         return
     if context.user_data.get('awaiting_surname'):
-        # Поиск по второму полю (например, фамилия)
         context.user_data['awaiting_surname'] = False
         await work_db.search_by_second_field(update, context)
-    elif context.user_data.get('add_record_in_progress'):
-        # Пошаговое добавление записи
+        return
+    if context.user_data.get('add_record_in_progress'):
         await add_record.handle_add_step(update, context)
         return
     if context.user_data.get('add_record_continue_or_exit'):

@@ -44,7 +44,9 @@ class WorkDB:
             add_record = AddRecord()
             await add_record.start_add(update, context)
         elif text == '5':
-            await update.message.reply_text("Введите данные для удаления (реализация позже)")
+            from db.del_record import DelRecord
+            del_record = DelRecord()
+            await del_record.start_delete(update, context)
         else:
             await update.message.reply_text("Некорректный выбор. Введите номер действия от 1 до 5.")
 
