@@ -49,8 +49,10 @@ async def admin_action_handler(update, context):
         return
     from db.work_db import WorkDB
     from db.edit_db import EditDB
+    from db.add_record import AddRecord
     work_db = WorkDB()
     edit_db = EditDB()
+    add_record = AddRecord()
     if context.user_data.get('editdb_awaiting_surname'):
         # Ожидание ввода фамилии для поиска в режиме редактирования
         await edit_db.handle_surname_search(update, context)
@@ -75,6 +77,13 @@ async def admin_action_handler(update, context):
         # Поиск по второму полю (например, фамилия)
         context.user_data['awaiting_surname'] = False
         await work_db.search_by_second_field(update, context)
+    elif context.user_data.get('add_record_in_progress'):
+        # Пошаговое добавление записи
+        await add_record.handle_add_step(update, context)
+        return
+    if context.user_data.get('add_record_continue_or_exit'):
+        await add_record.handle_continue_or_exit(update, context)
+        return
     else:
         await work_db.handle_admin_action(update, context)
 

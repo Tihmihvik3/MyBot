@@ -1,5 +1,6 @@
 from db.database import Database
 from db.edit_db import EditDB
+from db.add_record import AddRecord
 
 class WorkDB:
     def __init__(self):
@@ -39,7 +40,9 @@ class WorkDB:
             edit_db = EditDB()
             await edit_db.search_and_show_fields(update, context)
         elif text == '4':
-            await update.message.reply_text("Введите данные для добавления (реализация позже)")
+            # Запуск добавления записи
+            add_record = AddRecord()
+            await add_record.start_add(update, context)
         elif text == '5':
             await update.message.reply_text("Введите данные для удаления (реализация позже)")
         else:
