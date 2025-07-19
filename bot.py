@@ -9,7 +9,7 @@ logging.basicConfig(filename='bot.log', level=logging.INFO, format='%(asctime)s 
 
 async def start_command(update, context):
     # Ответ на команду /start с кнопками
-    keyboard = [["1", "2", "3", "4", "5", "6", "7", "8", "9"],
+    keyboard = [["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"],
                ["Новости", "Фото"], ["Видео", "Контакты"], ["Справка"]]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     await update.message.reply_text(
@@ -27,7 +27,7 @@ async def help_message(update, context):
 
 async def contact_message(update, context):
     # Ответ на сообщение "контакты"
-    await update.message.reply_text("Контакты: Вы можете связаться с нами по телефону +7 (123) 456-78-90 или email example@example.com.")
+    await update.message.reply_text("Контакты: Вы можете связаться с нами по телефону +7 (38453) 6-18-85 или email amvos42@gmail.com.")
 
 async def admin_message(update, context):
     # Обработчик для запроса "админ"
@@ -44,6 +44,18 @@ async def admin_message(update, context):
         await update.message.reply_text("Ошибка: база данных не найдена.")
 
 async def admin_action_handler(update, context):
+    from db.search_records import SearchRecords
+    search_records = SearchRecords()
+    # --- SearchRecords этапы ---
+    if context.user_data.get('searchrecords_awaiting_surname'):
+        await search_records.handle_surname_search(update, context)
+        return
+    if context.user_data.get('searchrecords_awaiting_choice'):
+        await search_records.handle_choose_result(update, context)
+        return
+    if context.user_data.get('searchrecords_repeat_or_exit'):
+        await search_records.handle_repeat_or_exit(update, context)
+        return
     # Обработчик выбора действия админа
     if not context.user_data.get('admin_mode'):
         return
@@ -94,7 +106,11 @@ async def admin_action_handler(update, context):
         await add_record.handle_continue_or_exit(update, context)
         return
     else:
-        await work_db.handle_admin_action(update, context)
+        # Если выбрано "2" — запуск поиска через SearchRecords
+        if update.message.text.strip() == '2':
+            await search_records.start_search(update, context)
+        else:
+            await work_db.handle_admin_action(update, context)
 
 async def news_message(update, context):
     await update.message.reply_text("Новости: Здесь будут последние новости организации.")

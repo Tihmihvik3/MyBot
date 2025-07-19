@@ -1,5 +1,7 @@
-settings.py
 config.py
+*.db
+members_vos.db
+settings.py
 *.log
 .vscode/
 .idea/
