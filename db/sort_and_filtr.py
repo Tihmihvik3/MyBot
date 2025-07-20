@@ -23,11 +23,68 @@ class SortAndFiltr:
         elif text == '2':
             await self.sort_gr1(update, context)
             context.user_data['sortfiltr_awaiting_sort_field'] = False
-        elif text in ('3', '4'):
-            await update.message.reply_text('Сортировка по выбранному полю пока не реализована.')
+        elif text == '3':
+            await self.sort_group(update, context)
+            context.user_data['sortfiltr_awaiting_sort_field'] = False
+        elif text == '4':
+            await self.sort_floor(update, context)
             context.user_data['sortfiltr_awaiting_sort_field'] = False
         else:
             await update.message.reply_text('Введите номер поля из списка.')
+
+    async def sort_group(self, update, context):
+        from db.database import Database
+        db = Database()
+        try:
+            with db.get_cursor() as cursor:
+                cursor.execute('SELECT `group`, surname, name, patronymic FROM members ORDER BY `group` COLLATE NOCASE ASC')
+                rows = cursor.fetchall()
+                if not rows:
+                    await update.message.reply_text('В базе нет данных.')
+                    return
+                msg = 'Список по группам:\n'
+                messages = []
+                for idx, row in enumerate(rows, 1):
+                    line = f"{idx}. {row[0]} | {row[1]} {row[2]} {row[3]}\n"
+                    if len(msg) + len(line) > 4000:
+                        messages.append(msg)
+                        msg = ''
+                    msg += line
+                if msg:
+                    messages.append(msg)
+                for m in messages:
+                    await update.message.reply_text(m)
+                await update.message.reply_text('1. Повторить сортировку\n2. Выход')
+                context.user_data['sortfiltr_repeat_or_exit'] = True
+        except Exception as e:
+            await update.message.reply_text(f'Ошибка при сортировке: {e}')
+
+    async def sort_floor(self, update, context):
+        from db.database import Database
+        db = Database()
+        try:
+            with db.get_cursor() as cursor:
+                cursor.execute('SELECT floor, surname, name, patronymic FROM members ORDER BY floor COLLATE NOCASE ASC')
+                rows = cursor.fetchall()
+                if not rows:
+                    await update.message.reply_text('В базе нет данных.')
+                    return
+                msg = 'Список по полу:\n'
+                messages = []
+                for idx, row in enumerate(rows, 1):
+                    line = f"{idx}. {row[0]} | {row[1]} {row[2]} {row[3]}\n"
+                    if len(msg) + len(line) > 4000:
+                        messages.append(msg)
+                        msg = ''
+                    msg += line
+                if msg:
+                    messages.append(msg)
+                for m in messages:
+                    await update.message.reply_text(m)
+                await update.message.reply_text('1. Повторить сортировку\n2. Выход')
+                context.user_data['sortfiltr_repeat_or_exit'] = True
+        except Exception as e:
+            await update.message.reply_text(f'Ошибка при сортировке: {e}')
 
     async def sort_surname(self, update, context):
         from db.database import Database
