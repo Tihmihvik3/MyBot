@@ -1,3 +1,6 @@
+async def get_user_id_message(update, context):
+    user_id = update.message.from_user.id
+    await update.message.reply_text(f"Ваш уникальный идентификатор Telegram: {user_id}")
 from telegram import ReplyKeyboardMarkup
 from telegram.ext import Application, MessageHandler, CommandHandler, filters
 import settings
@@ -30,20 +33,29 @@ async def contact_message(update, context):
     await update.message.reply_text("Контакты: Вы можете связаться с нами по телефону +7 (38453) 6-18-85 или email amvos42@gmail.com.")
 
 async def admin_message(update, context):
-    # Обработчик для запроса "админ"
-    from db.database import Database
-    db = Database()
-    if db.connection:
-        await update.message.reply_text("Режим администратора: подключение к базе данных выполнено.")
-        # После успешного подключения выводим меню действий
+    # Проверка роли пользователя через VerificationID
+    from verification_id import VerificationID
+    verifier = VerificationID()
+    USER_ROLE = await verifier.check_role(update, context)
+    if USER_ROLE in ("admin", "super admin"):
+        await update.message.reply_text("Режим администратора: доступ разрешён.")
         await update.message.reply_text(
-            "Выберите действие:\n1. Показать весь список.\n2. Найти по фамилии.\n3. Редактировать данные.\n4. Добавить данные.\n5. Удалить данные.\nВведите номер действия:")
-        # Сохраняем состояние ожидания выбора действия
+            "Выберите действие:\n1. Показать весь список.\n2. Найти по фамилии.\n3. Редактировать данные.\n4. Добавить данные.\n5. Удалить данные.\n6. Сортировка и фильтр.\nВведите номер действия:")
         context.user_data['admin_mode'] = True
     else:
-        await update.message.reply_text("Ошибка: база данных не найдена.")
+        await update.message.reply_text("Эта команда вам не доступна. Обратитесь к администратору бота.")
+        context.user_data['admin_mode'] = False
 
 async def admin_action_handler(update, context):
+    from db.sort_and_filtr import SortAndFiltr
+    sortfiltr = SortAndFiltr()
+    # --- SortAndFiltr этапы ---
+    if context.user_data.get('sortfiltr_awaiting_action'):
+        await sortfiltr.handle_action(update, context)
+        return
+    if context.user_data.get('sortfiltr_awaiting_sort_field'):
+        await sortfiltr.handle_sort_field(update, context)
+        return
     from db.search_records import SearchRecords
     search_records = SearchRecords()
     # --- SearchRecords этапы ---
@@ -109,6 +121,9 @@ async def admin_action_handler(update, context):
         # Если выбрано "2" — запуск поиска через SearchRecords
         if update.message.text.strip() == '2':
             await search_records.start_search(update, context)
+        # Если выбрано "6" — запуск сортировки и фильтра
+        elif update.message.text.strip() == '6':
+            await sortfiltr.start(update, context)
         else:
             await work_db.handle_admin_action(update, context)
 
@@ -143,6 +158,8 @@ def main():
 
     # Добавляем обработчик сообщений с фильтром на текст "админ"
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'(?i)админ'), admin_message))
+    # Добавляем обработчик для получения идентификатора пользователя
+    application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'(?i)получить идентификатор'), get_user_id_message))
     # Добавляем обработчик для выбора действия админа
     application.add_handler(MessageHandler(filters.TEXT & (~filters.Regex(r'(?i)админ')), admin_action_handler))
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'(?i)новости'), news_message))
