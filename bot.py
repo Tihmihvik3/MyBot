@@ -47,6 +47,9 @@ async def admin_message(update, context):
         context.user_data['admin_mode'] = False
 
 async def admin_action_handler(update, context):
+    if context.user_data.get('sortfiltr_repeat_or_exit'):
+        await sortfiltr.handle_repeat_or_exit(update, context)
+        return
     from db.sort_and_filtr import SortAndFiltr
     sortfiltr = SortAndFiltr()
     # --- SortAndFiltr этапы ---
