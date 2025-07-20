@@ -18,66 +18,70 @@ class SortAndFiltr:
     async def handle_sort_field(self, update, context):
         text = update.message.text.strip()
         if text == '1':
-            # Сортировка по фамилии
-            from db.database import Database
-            db = Database()
-            try:
-                with db.get_cursor() as cursor:
-                    cursor.execute('SELECT surname, name, patronymic FROM members ORDER BY surname COLLATE NOCASE ASC')
-                    rows = cursor.fetchall()
-                    if not rows:
-                        await update.message.reply_text('В базе нет данных.')
-                        return
-                    msg = 'Список по фамилии:\n'
-                    messages = []
-                    for idx, row in enumerate(rows, 1):
-                        line = f"{idx}. {row[0]} {row[1]} {row[2]}\n"
-                        if len(msg) + len(line) > 4000:
-                            messages.append(msg)
-                            msg = ''
-                        msg += line
-                    if msg:
-                        messages.append(msg)
-                    for m in messages:
-                        await update.message.reply_text(m)
-                    await update.message.reply_text('1. Повторить сортировку\n2. Выход')
-                    context.user_data['sortfiltr_repeat_or_exit'] = True
-            except Exception as e:
-                await update.message.reply_text(f'Ошибка при сортировке: {e}')
+            await self.sort_surname(update, context)
             context.user_data['sortfiltr_awaiting_sort_field'] = False
         elif text == '2':
-            # Сортировка по группе инвалидности
-            from db.database import Database
-            db = Database()
-            try:
-                with db.get_cursor() as cursor:
-                    cursor.execute('SELECT group_disability, surname, name, patronymic FROM members ORDER BY group_disability COLLATE NOCASE ASC')
-                    rows = cursor.fetchall()
-                    if not rows:
-                        await update.message.reply_text('В базе нет данных.')
-                        return
-                    msg = 'Список по группе инвалидности:\n'
-                    messages = []
-                    for idx, row in enumerate(rows, 1):
-                        line = f"{idx}. {row[0]} | {row[1]} {row[2]} {row[3]}\n"
-                        if len(msg) + len(line) > 4000:
-                            messages.append(msg)
-                            msg = ''
-                        msg += line
-                    if msg:
-                        messages.append(msg)
-                    for m in messages:
-                        await update.message.reply_text(m)
-                    await update.message.reply_text('1. Повторить сортировку\n2. Выход')
-                    context.user_data['sortfiltr_repeat_or_exit'] = True
-            except Exception as e:
-                await update.message.reply_text(f'Ошибка при сортировке: {e}')
+            await self.sort_gr1(update, context)
             context.user_data['sortfiltr_awaiting_sort_field'] = False
         elif text in ('3', '4'):
             await update.message.reply_text('Сортировка по выбранному полю пока не реализована.')
             context.user_data['sortfiltr_awaiting_sort_field'] = False
         else:
             await update.message.reply_text('Введите номер поля из списка.')
+
+    async def sort_surname(self, update, context):
+        from db.database import Database
+        db = Database()
+        try:
+            with db.get_cursor() as cursor:
+                cursor.execute('SELECT surname, name, patronymic FROM members ORDER BY surname COLLATE NOCASE ASC')
+                rows = cursor.fetchall()
+                if not rows:
+                    await update.message.reply_text('В базе нет данных.')
+                    return
+                msg = 'Список по фамилии:\n'
+                messages = []
+                for idx, row in enumerate(rows, 1):
+                    line = f"{idx}. {row[0]} {row[1]} {row[2]}\n"
+                    if len(msg) + len(line) > 4000:
+                        messages.append(msg)
+                        msg = ''
+                    msg += line
+                if msg:
+                    messages.append(msg)
+                for m in messages:
+                    await update.message.reply_text(m)
+                await update.message.reply_text('1. Повторить сортировку\n2. Выход')
+                context.user_data['sortfiltr_repeat_or_exit'] = True
+        except Exception as e:
+            await update.message.reply_text(f'Ошибка при сортировке: {e}')
+
+    async def sort_gr1(self, update, context):
+        from db.database import Database
+        db = Database()
+        try:
+            with db.get_cursor() as cursor:
+                cursor.execute('SELECT group_disability, surname, name, patronymic FROM members ORDER BY group_disability COLLATE NOCASE ASC')
+                rows = cursor.fetchall()
+                if not rows:
+                    await update.message.reply_text('В базе нет данных.')
+                    return
+                msg = 'Список по группе инвалидности:\n'
+                messages = []
+                for idx, row in enumerate(rows, 1):
+                    line = f"{idx}. {row[0]} | {row[1]} {row[2]} {row[3]}\n"
+                    if len(msg) + len(line) > 4000:
+                        messages.append(msg)
+                        msg = ''
+                    msg += line
+                if msg:
+                    messages.append(msg)
+                for m in messages:
+                    await update.message.reply_text(m)
+                await update.message.reply_text('1. Повторить сортировку\n2. Выход')
+                context.user_data['sortfiltr_repeat_or_exit'] = True
+        except Exception as e:
+            await update.message.reply_text(f'Ошибка при сортировке: {e}')
 
     async def handle_repeat_or_exit(self, update, context):
         text = update.message.text.strip()
