@@ -1,15 +1,17 @@
 class SortAndFiltr:
+    # Глобальная переменная для хранения текста действия
+    GLOBAL_SORTFILTR_TEXT = None
     async def start(self, update, context):
         await update.message.reply_text('Выберите действие:\n1. Сортировать по\n2. Фильтровать по')
         context.user_data['sortfiltr_awaiting_action'] = True
-
+        
     async def handle_action(self, update, context):
-        text = update.message.text.strip()
-        if text == '1':
+        SortAndFiltr.GLOBAL_SORTFILTR_TEXT = update.message.text.strip()
+        if SortAndFiltr.GLOBAL_SORTFILTR_TEXT == '1':
             await update.message.reply_text('Выберите поле для сортировки:\n1. По фамилии\n2. По группе инвалидности\n3. По группам\n4. По полу')
             context.user_data['sortfiltr_awaiting_sort_field'] = True
             context.user_data['sortfiltr_awaiting_action'] = False
-        elif text == '2':
+        elif SortAndFiltr.GLOBAL_SORTFILTR_TEXT == '2':
             await update.message.reply_text('Фильтрация по выбранному полю пока не реализована.')
             context.user_data['sortfiltr_awaiting_action'] = False
         else:
@@ -54,8 +56,6 @@ class SortAndFiltr:
                     messages.append(msg)
                 for m in messages:
                     await update.message.reply_text(m)
-                await update.message.reply_text('1. Повторить сортировку\n2. Выход')
-                context.user_data['sortfiltr_repeat_or_exit'] = True
         except Exception as e:
             await update.message.reply_text(f'Ошибка при сортировке: {e}')
 
@@ -81,8 +81,6 @@ class SortAndFiltr:
                     messages.append(msg)
                 for m in messages:
                     await update.message.reply_text(m)
-                await update.message.reply_text('1. Повторить сортировку\n2. Выход')
-                context.user_data['sortfiltr_repeat_or_exit'] = True
         except Exception as e:
             await update.message.reply_text(f'Ошибка при сортировке: {e}')
 
@@ -108,8 +106,6 @@ class SortAndFiltr:
                     messages.append(msg)
                 for m in messages:
                     await update.message.reply_text(m)
-                await update.message.reply_text('1. Повторить сортировку\n2. Выход')
-                context.user_data['sortfiltr_repeat_or_exit'] = True
         except Exception as e:
             await update.message.reply_text(f'Ошибка при сортировке: {e}')
 
@@ -135,20 +131,6 @@ class SortAndFiltr:
                     messages.append(msg)
                 for m in messages:
                     await update.message.reply_text(m)
-                await update.message.reply_text('1. Повторить сортировку\n2. Выход')
-                context.user_data['sortfiltr_repeat_or_exit'] = True
         except Exception as e:
             await update.message.reply_text(f'Ошибка при сортировке: {e}')
 
-    async def handle_repeat_or_exit(self, update, context):
-        text = update.message.text.strip()
-        if text == '1':
-            await update.message.reply_text('Выберите поле для сортировки:\n1. По фамилии\n2. По группе инвалидности\n3. По группам\n4. По полу')
-            context.user_data['sortfiltr_awaiting_sort_field'] = True
-            context.user_data['sortfiltr_repeat_or_exit'] = False
-        elif text == '2':
-            await update.message.reply_text('Выберите действие администратора:\n1. Показать весь список.\n2. Найти по фамилии.\n3. Редактировать данные.\n4. Добавить данные.\n5. Удалить данные.\n6. Сортировка и фильтр.\nВведите номер действия:')
-            context.user_data['sortfiltr_repeat_or_exit'] = False
-            context.user_data['admin_mode'] = True
-        else:
-            await update.message.reply_text('Введите 1 (повторить) или 2 (выход).')
