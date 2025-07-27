@@ -40,7 +40,7 @@ async def admin_message(update, context):
     if USER_ROLE in ("admin", "super admin"):
         await update.message.reply_text("Режим администратора: доступ разрешён.")
         await update.message.reply_text(
-            "Выберите действие:\n1. Показать весь список.\n2. Найти по фамилии.\n3. Редактировать данные.\n4. Добавить данные.\n5. Удалить данные.\n6. Сортировка и фильтр.\nВведите номер действия:")
+            "Выберите действие:\n1. Показать весь список.\n2. Найти по фамилии.\n3. Редактировать запись.\n4. Добавить запись.\n5. Удалить запись.\n6. Сортировка и фильтр.\nВведите номер действия:")
         context.user_data['admin_mode'] = True
     else:
         await update.message.reply_text("Эта команда вам не доступна. Обратитесь к администратору бота.")
@@ -58,6 +58,9 @@ async def admin_action_handler(update, context):
         return
     if context.user_data.get('sortfiltr_awaiting_sort_field'):
         await sortfiltr.handle_sort_field(update, context)
+        return
+    if context.user_data.get('awaiting_return_menu'):
+        await sortfiltr.handle_return_menu_choice(update, context)
         return
     from db.search_records import SearchRecords
     search_records = SearchRecords()

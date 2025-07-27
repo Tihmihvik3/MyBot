@@ -32,6 +32,25 @@ class WorkDB:
                         await update.message.reply_text('В базе нет данных.')
             except Exception as e:
                 await update.message.reply_text(f'Ошибка при чтении базы: {e}')
+
+            # После вывода списка предложить действия
+            await update.message.reply_text('Выберите действие:\n1. Сортировать записи\n0. Выйти')
+            context.user_data['workdb_awaiting_action_after_list'] = True
+            return
+        # Обработка выбора после вывода списка
+        if context.user_data.get('workdb_awaiting_action_after_list'):
+            if text == '1':
+                await update.message.reply_text('Сортировка пока не реализована.')
+                context.user_data['workdb_awaiting_action_after_list'] = False
+            elif text == '0':
+                await update.message.reply_text('Возврат в главное меню администратора.')
+                context.user_data['workdb_awaiting_action_after_list'] = False
+                from bot import admin_message
+                await admin_message(update, context)
+                return
+            else:
+                await update.message.reply_text('Пожалуйста, выберите 1 (сортировать) или 0 (выйти).')
+            return
         elif text == '2':
             await update.message.reply_text("Введите фамилию для поиска:")
             context.user_data['awaiting_surname'] = True
