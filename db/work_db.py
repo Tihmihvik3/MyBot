@@ -5,52 +5,44 @@ from db.add_record import AddRecord
 class WorkDB:
     def __init__(self):
         self.db = Database()
+    # ...
 
     async def handle_admin_action(self, update, context):
         text = update.message.text.strip()
-        if text == '1':
-            # Показать все записи (первые четыре поля) из таблицы members, нумерация вместо первого поля
-            try:
-                with self.db.get_cursor() as cursor:
-                    cursor.execute('SELECT * FROM members')
-                    rows = cursor.fetchall()
-                    if rows:
-                        msg = 'Список пользователей (первые 4 поля, первая — номер):\n'
-                        messages = []
-                        for idx, row in enumerate(rows, 1):
-                            # Заменяем первое поле на номер
-                            line = f"{idx} | " + ' | '.join(str(field) for field in row[1:4]) + '\n'
-                            if len(msg) + len(line) > 4000:
-                                messages.append(msg)
-                                msg = ''
-                            msg += line
-                        if msg:
-                            messages.append(msg)
-                        for m in messages:
-                            await update.message.reply_text(m)
-                    else:
-                        await update.message.reply_text('В базе нет данных.')
-            except Exception as e:
-                await update.message.reply_text(f'Ошибка при чтении базы: {e}')
-
-            # После вывода списка предложить действия
-            await update.message.reply_text('Выберите действие:\n1. Сортировать записи\n0. Выйти')
-            context.user_data['workdb_awaiting_action_after_list'] = True
-            return
-        # Обработка выбора после вывода списка
-        if context.user_data.get('workdb_awaiting_action_after_list'):
-            if text == '1':
-                await update.message.reply_text('Сортировка пока не реализована.')
-                context.user_data['workdb_awaiting_action_after_list'] = False
-            elif text == '0':
-                await update.message.reply_text('Возврат в главное меню администратора.')
-                context.user_data['workdb_awaiting_action_after_list'] = False
-                from bot import admin_message
-                await admin_message(update, context)
+        # Если ожидается выбор пользователя из отсортированного списка
+        if context.user_data.get('awaiting_member_detail_choice'):
+            context.user_data['awaiting_member_detail_choice'] = False
+            if text == '0':
+                await update.message.reply_text('Выход в меню администратора.')
                 return
-            else:
-                await update.message.reply_text('Пожалуйста, выберите 1 (сортировать) или 0 (выйти).')
+            try:
+                idx = int(text)
+                members_list = context.user_data.get('sorted_members_list', [])
+                if 1 <= idx <= len(members_list):
+                    member_id = members_list[idx - 1]
+                    with self.db.get_cursor() as cursor:
+                        cursor.execute('PRAGMA table_info(members)')
+                        columns = [col[1] for col in cursor.fetchall()]
+                        # Получаем все поля, кроме id, telegram_id, role
+                        # Исключаем зарезервированные слова и некорректные поля
+                        reserved = {'id', 'telegram_id', 'role', 'group'}
+                        select_fields = [col for col in columns if col not in reserved and col.isidentifier() and not (col.lower() == 'group')]
+                        # Экранируем имена столбцов кавычками
+                        fields_sql = ', '.join([f'"{col}"' for col in select_fields])
+                        cursor.execute(f"SELECT {fields_sql} FROM members WHERE id = ?", (member_id,))
+                        result = cursor.fetchone()
+                        if result:
+                            details = '\n'.join(f"{field}: {value}" for field, value in zip(select_fields, result))
+                            await update.message.reply_text(f'Данные выбранной записи:\n{details}')
+                        else:
+                            await update.message.reply_text('Запись не найдена.')
+                else:
+                    await update.message.reply_text('Некорректный номер. Попробуйте снова.')
+            except Exception as e:
+                await update.message.reply_text(f'Ошибка при выборе записи: {e}')
             return
+        if text == '1':
+            await self.show_sorted_by_surname(update, context)
         elif text == '2':
             await update.message.reply_text("Введите фамилию для поиска:")
             context.user_data['awaiting_surname'] = True
@@ -68,6 +60,38 @@ class WorkDB:
             await del_record.start_delete(update, context)
         else:
             await update.message.reply_text("Некорректный выбор. Введите номер действия от 1 до 5.")
+
+    async def show_sorted_by_surname(self, update, context):
+        """
+        Выводит отсортированный по фамилии список пользователей (нумерация, Фамилия, Имя, Отчество),
+        затем предлагает выбрать номер для подробного просмотра или 0 для выхода.
+        """
+        try:
+            with self.db.get_cursor() as cursor:
+                cursor.execute('SELECT id, surname, name, patronymic FROM members ORDER BY surname COLLATE NOCASE ASC')
+                rows = cursor.fetchall()
+                if rows:
+                    msg = 'Список пользователей (отсортировано по фамилии):\n'
+                    messages = []
+                    for idx, row in enumerate(rows, 1):
+                        # row = (id, surname, name, patronymic)
+                        line = f"{idx} | {row[1]} | {row[2]} | {row[3]}\n"
+                        if len(msg) + len(line) > 4000:
+                            messages.append(msg)
+                            msg = ''
+                        msg += line
+                    if msg:
+                        messages.append(msg)
+                    for m in messages:
+                        await update.message.reply_text(m)
+                    # Сохраняем соответствие номера и id для последующего выбора
+                    context.user_data['sorted_members_list'] = [row[0] for row in rows]
+                    await update.message.reply_text('Введите номер записи для подробного просмотра или 0 для выхода:')
+                    context.user_data['awaiting_member_detail_choice'] = True
+                else:
+                    await update.message.reply_text('В базе нет данных.')
+        except Exception as e:
+            await update.message.reply_text(f'Ошибка при сортировке: {e}')
 
     async def search_by_second_field(self, update, context):
         # Поиск по полю surname без учёта регистра, вывод всех полей, поиск по началу фамилии (LIKE ...%)
