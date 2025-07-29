@@ -1,9 +1,8 @@
-
+from bot import admin_message
 from db.database import Database
 from db.edit_db import EditDB
 from db.add_record import AddRecord
 from db.del_record import DelRecord
-from bot import admin_message
 
 class WorkDB:
     def __init__(self):
@@ -20,6 +19,10 @@ class WorkDB:
         # Обработка выбора пользователя из отсортированного списка
         if context.user_data.get('awaiting_member_detail_choice'):
             await self._handle_member_detail_choice(update, context, text)
+            return
+        # Обработка выбора действия над записью (редактировать/удалить/выйти)
+        if context.user_data.get('awaiting_member_details_action'):
+            await self.handle_member_details_action(update, context)
             return
         # Основное меню действий
         actions = {
@@ -42,7 +45,7 @@ class WorkDB:
         context.user_data['awaiting_member_detail_choice'] = False
         if text == '0':
             await update.message.reply_text('Выход в меню администратора.')
-            from bot import admin_message
+            
             await admin_message(update, context)
             return
         try:
@@ -53,7 +56,7 @@ class WorkDB:
         members_list = context.user_data.get('sorted_members_list', [])
         if 1 <= idx <= len(members_list):
             member_id = members_list[idx - 1]
-            await self.show_member_details(update, member_id)
+            await self.show_member_details(update, context, member_id)
         else:
             await update.message.reply_text('Некорректный номер. Попробуйте снова.')
 
@@ -140,9 +143,9 @@ class WorkDB:
         'floor': 'Пол',
     }
 
-    async def show_member_details(self, update, member_id):
+    async def show_member_details(self, update, context, member_id):
         """
-        Выводит подробные данные выбранной записи с пользовательскими названиями полей
+        Выводит подробные данные выбранной записи с пользовательскими названиями полей и предлагает действия над записью.
         """
         try:
             with self.db.get_cursor() as cursor:
@@ -155,10 +158,40 @@ class WorkDB:
                 if result:
                     details = '\n'.join(f"{self.FIELD_MAP.get(field, field)}: {value}" for field, value in zip(select_fields, result))
                     await update.message.reply_text(f'Данные выбранной записи:\n{details}')
+                    await update.message.reply_text(
+                        'Выберите действие для этой записи:\n1. Редактировать данные\n2. Удалить запись\n0. Выйти'
+                    )
+                    # Сохраняем id выбранной записи и ожидаем ввод действия
+                    context.user_data['member_details_id'] = member_id
+                    context.user_data['awaiting_member_details_action'] = True
                 else:
                     await update.message.reply_text('Запись не найдена.')
         except Exception as e:
             await update.message.reply_text(f'Ошибка при выборе записи: {e}')
+    async def handle_member_details_action(self, update, context):
+        """
+        Обрабатывает выбор действия над записью: редактировать, удалить, выйти.
+        """
+        text = update.message.text.strip()
+        member_id = context.user_data.get('member_details_id')
+        context.user_data['awaiting_member_details_action'] = False
+        if text == '0':
+            from bot import admin_message
+            await admin_message(update, context)
+            return
+        elif text == '1':
+            from db.edit_db import EditDB
+            edit_db = EditDB()
+            await edit_db.edit_member_by_id(update, context, member_id)
+            return
+        elif text == '2':
+            from db.del_record import DelRecord
+            del_record = DelRecord()
+            await del_record.delete_member_by_id(update, context, member_id)
+            return
+        else:
+            await update.message.reply_text('Некорректный выбор. Введите 1, 2 или 0.')
+            context.user_data['awaiting_member_details_action'] = True
 
     async def search_by_second_field(self, update, context):
         """
