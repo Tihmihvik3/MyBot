@@ -1,12 +1,13 @@
-async def get_user_id_message(update, context):
-    user_id = update.message.from_user.id
-    await update.message.reply_text(f"Ваш уникальный идентификатор Telegram: {user_id}")
 from telegram import ReplyKeyboardMarkup
 from telegram.ext import Application, MessageHandler, CommandHandler, filters
 import settings
 import logging
 from db.models import User
 
+
+async def get_user_id_message(update, context):
+    user_id = update.message.from_user.id
+    await update.message.reply_text(f"Ваш уникальный идентификатор Telegram: {user_id}")
 
 logging.basicConfig(filename='bot.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -47,32 +48,20 @@ async def admin_message(update, context):
         context.user_data['admin_mode'] = False
 
 async def admin_action_handler(update, context):
-    if context.user_data.get('sortfiltr_repeat_or_exit'):
-        await sortfiltr.handle_repeat_or_exit(update, context)
-        return
+    """
+    Обработчик выбора действия админа
+    """
     from db.sort_and_filtr import SortAndFiltr
     sortfiltr = SortAndFiltr()
-    # --- SortAndFiltr этапы ---
-    if context.user_data.get('sortfiltr_awaiting_action'):
-        await sortfiltr.handle_action(update, context)
-        return
-    if context.user_data.get('sortfiltr_awaiting_sort_field'):
-        await sortfiltr.handle_sort_field(update, context)
-        return
-    if context.user_data.get('awaiting_return_menu'):
-        await sortfiltr.handle_return_menu_choice(update, context)
+    # --- Делегируем обработку состояний SortAndFiltr в модуль sort_and_filtr.py ---
+    processed = await sortfiltr.process_state(update, context)
+    if processed:
         return
     from db.search_records import SearchRecords
     search_records = SearchRecords()
-    # --- SearchRecords этапы ---
-    if context.user_data.get('searchrecords_awaiting_surname'):
-        await search_records.handle_surname_search(update, context)
-        return
-    if context.user_data.get('searchrecords_awaiting_choice'):
-        await search_records.handle_choose_result(update, context)
-        return
-    if context.user_data.get('searchrecords_repeat_or_exit'):
-        await search_records.handle_repeat_or_exit(update, context)
+    # --- Делегируем обработку состояний SearchRecords ---
+    processed = await search_records.process_state(update, context)
+    if processed:
         return
     # Обработчик выбора действия админа
     if not context.user_data.get('admin_mode'):
@@ -85,43 +74,21 @@ async def admin_action_handler(update, context):
     edit_db = EditDB()
     add_record = AddRecord()
     del_record = DelRecord()
-    # --- DelRecord этапы ---
-    if context.user_data.get('delrecord_awaiting_surname'):
-        await del_record.handle_surname_search(update, context)
+    # --- Делегируем обработку состояний DelRecord ---
+    processed = await del_record.process_state(update, context)
+    if processed:
         return
-    if context.user_data.get('delrecord_awaiting_choice'):
-        await del_record.handle_choose_result(update, context)
-        return
-    if context.user_data.get('delrecord_awaiting_confirm'):
-        await del_record.handle_confirm(update, context)
-        return
-    if context.user_data.get('delrecord_repeat_or_exit'):
-        await del_record.handle_repeat_or_exit(update, context)
-        return
-    if context.user_data.get('editdb_awaiting_surname'):
-        await edit_db.handle_surname_search(update, context)
-        return
-    if context.user_data.get('editdb_awaiting_choice'):
-        await edit_db.handle_choose_result(update, context)
-        return
-    if context.user_data.get('editdb_awaiting_field'):
-        await edit_db.handle_field_edit(update, context)
-        return
-    if context.user_data.get('editdb_awaiting_new_value'):
-        await edit_db.handle_new_value(update, context)
-        return
-    if context.user_data.get('editdb_continue_or_exit'):
-        await edit_db.handle_continue_or_exit(update, context)
+    # --- Делегируем обработку состояний EditDB ---
+    processed = await edit_db.process_state(update, context)
+    if processed:
         return
     if context.user_data.get('awaiting_surname'):
         context.user_data['awaiting_surname'] = False
         await work_db.search_by_second_field(update, context)
         return
-    if context.user_data.get('add_record_in_progress'):
-        await add_record.handle_add_step(update, context)
-        return
-    if context.user_data.get('add_record_continue_or_exit'):
-        await add_record.handle_continue_or_exit(update, context)
+    # --- Делегируем обработку состояний AddRecord ---
+    processed = await add_record.process_state(update, context)
+    if processed:
         return
     else:
         # Если выбрано "2" — запуск поиска через SearchRecords
@@ -131,7 +98,7 @@ async def admin_action_handler(update, context):
         elif update.message.text.strip() == '6':
             await sortfiltr.start(update, context)
         else:
-            await work_db.handle_admin_action(update, context)
+                await work_db.handle_admin_action(update, context)
 
 async def news_message(update, context):
     await update.message.reply_text("Новости: Здесь будут последние новости организации.")

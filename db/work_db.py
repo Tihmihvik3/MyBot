@@ -85,7 +85,6 @@ class WorkDB:
         """
         Запускает процесс удаления записи пользователя.
         """
-        from db.del_record import DelRecord
         del_record = DelRecord()
         await del_record.start_delete(update, context)
 
@@ -116,15 +115,16 @@ class WorkDB:
                     msg = ''
                 msg += line
             if msg:
-                messages.append(msg)
+                messages.append(msg)  # Отправляем сообщения по частям, если они слишком длинные
             for m in messages:
                 await update.message.reply_text(m)
             context.user_data['sorted_members_list'] = [row[0] for row in rows]
             await update.message.reply_text('Введите номер записи для подробного просмотра или 0 для выхода:')
-            context.user_data['awaiting_member_detail_choice'] = True
+            context.user_data['awaiting_member_detail_choice'] = True  # Ожидаем выбора пользователя
         else:
             await update.message.reply_text('В базе нет данных.')
-    FIELD_MAP = {
+    
+    FIELD_MAP = {  # Сопоставление полей базы данных с пользовательскими названиями
         'surname': 'Фамилия',
         'name': 'Имя',
         'patronymic': 'Отчество',
@@ -176,7 +176,6 @@ class WorkDB:
         member_id = context.user_data.get('member_details_id')
         context.user_data['awaiting_member_details_action'] = False
         if text == '0':
-            from bot import admin_message
             await admin_message(update, context)
             return
         elif text == '1':

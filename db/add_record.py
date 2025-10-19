@@ -59,3 +59,16 @@ class AddRecord:
             context.user_data['admin_mode'] = True
         else:
             await update.message.reply_text('Введите 1 (продолжить) или 2 (выход).')
+
+    async def process_state(self, update, context):
+        """
+        Универсальная обработка состояний для AddRecord.
+        Возвращает True, если модуль обработал текущее сообщение.
+        """
+        if context.user_data.get('add_record_in_progress'):
+            await self.handle_add_step(update, context)
+            return True
+        if context.user_data.get('add_record_continue_or_exit'):
+            await self.handle_continue_or_exit(update, context)
+            return True
+        return False

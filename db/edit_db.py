@@ -136,3 +136,25 @@ class EditDB:
             context.user_data['admin_mode'] = True
         else:
             await update.message.reply_text('Введите 1 (продолжить) или 2 (выход).')
+
+    async def process_state(self, update, context):
+        """
+        Универсальная обработка состояний для EditDB.
+        Возвращает True если сообщение обработано модулем.
+        """
+        if context.user_data.get('editdb_continue_or_exit'):
+            await self.handle_continue_or_exit(update, context)
+            return True
+        if context.user_data.get('editdb_awaiting_surname'):
+            await self.handle_surname_search(update, context)
+            return True
+        if context.user_data.get('editdb_awaiting_choice'):
+            await self.handle_choose_result(update, context)
+            return True
+        if context.user_data.get('editdb_awaiting_field'):
+            await self.handle_field_edit(update, context)
+            return True
+        if context.user_data.get('editdb_awaiting_new_value'):
+            await self.handle_new_value(update, context)
+            return True
+        return False

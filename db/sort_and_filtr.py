@@ -183,3 +183,55 @@ class SortAndFiltr:
             
         else:
             await update.message.reply_text('Пожалуйста, выберите 1 (сохранить) или 2 (не сохранять).')
+
+    async def process_state(self, update, context):
+        """
+        Универсальный обработчик состояний для SortAndFiltr.
+        Если какой-либо из флагов состояния для SortAndFiltr установлен, вызывает
+        соответствующий метод и возвращает True (чтобы бот не продолжал основную обработку).
+        Возвращает False, если никаких флагов SortAndFiltr не установлено.
+        """
+        # Повтор или выход из SortAndFiltr
+        if context.user_data.get('sortfiltr_repeat_or_exit'):
+            await self.handle_repeat_or_exit(update, context)
+            return True
+
+        if context.user_data.get('sortfiltr_awaiting_action'):
+            await self.handle_action(update, context)
+            return True
+
+        if context.user_data.get('sortfiltr_awaiting_sort_field'):
+            await self.handle_sort_field(update, context)
+            return True
+
+        if context.user_data.get('awaiting_return_menu'):
+            await self.handle_return_menu_choice(update, context)
+            return True
+
+        return False
+
+    async def handle_repeat_or_exit(self, update, context):
+        """
+        Обрабатывает выбор пользователя при флаге повтор/выход.
+        Ожидает ввод: '1' — повторить (возврат в меню SortAndFiltr), '2' — выйти в админ-меню.
+        Если ввод некорректен, повторно запрашивает выбор.
+        """
+        text = update.message.text.strip()
+        # Если флаг выставлен и это первый вызов — предложим пользователю выбор
+        if text not in ('1', '2'):
+            await update.message.reply_text('Повтор или выход?\n1. Повторить\n2. Выйти')
+            # Оставляем флаг активным, чтобы следующий ввод был обработан этим методом
+            context.user_data['sortfiltr_repeat_or_exit'] = True
+            return
+
+        # Сбрасываем флаг — выбор будет обработан
+        context.user_data['sortfiltr_repeat_or_exit'] = False
+        if text == '1':
+            # Повтор — просто вернём пользователя в начало SortAndFiltr
+            await self.start(update, context)
+            return
+        elif text == '2':
+            # Выход — вернуть в главное меню администратора
+            from bot import admin_message
+            await admin_message(update, context)
+            return

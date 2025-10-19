@@ -89,3 +89,22 @@ class DelRecord:
             context.user_data['admin_mode'] = True
         else:
             await update.message.reply_text('Введите 1 (повторить) или 2 (выход).')
+
+    async def process_state(self, update, context):
+        """
+        Универсальный обработчик состояния для DelRecord.
+        Возвращает True, если модуль обработал текущее сообщение.
+        """
+        if context.user_data.get('delrecord_repeat_or_exit'):
+            await self.handle_repeat_or_exit(update, context)
+            return True
+        if context.user_data.get('delrecord_awaiting_surname'):
+            await self.handle_surname_search(update, context)
+            return True
+        if context.user_data.get('delrecord_awaiting_choice'):
+            await self.handle_choose_result(update, context)
+            return True
+        if context.user_data.get('delrecord_awaiting_confirm'):
+            await self.handle_confirm(update, context)
+            return True
+        return False

@@ -73,3 +73,19 @@ class SearchRecords:
         for i, field in enumerate(fields):
             msg += f"{field}: {row[i+1]}\n"
         await update.message.reply_text(msg)
+
+    async def process_state(self, update, context):
+        """
+        Универсальная обработка состояний для SearchRecords.
+        Возвращает True, если сообщение обработано модулем (нужно прекратить дальнейшую обработку).
+        """
+        if context.user_data.get('searchrecords_repeat_or_exit'):
+            await self.handle_repeat_or_exit(update, context)
+            return True
+        if context.user_data.get('searchrecords_awaiting_surname'):
+            await self.handle_surname_search(update, context)
+            return True
+        if context.user_data.get('searchrecords_awaiting_choice'):
+            await self.handle_choose_result(update, context)
+            return True
+        return False
