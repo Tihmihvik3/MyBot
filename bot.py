@@ -103,11 +103,16 @@ async def admin_action_handler(update, context):
         # Если выбрано "6" — запуск сортировки и фильтра
         elif update.message.text.strip() == '6':
             await sortfiltr.start(update, context)
-        # Если введено слово 'диспетчерская' (без учета регистра) — перейти в ControlRoom
-        elif update.message.text.strip().lower() == 'диспетчерская':
-            await control.start(update, context)
+        # Прямой вход в диспетчерскую теперь обрабатывается отдельным handler'ом (control_entry)
         else:
                 await work_db.handle_admin_action(update, context)
+
+
+async def control_entry(update, context):
+    """Обработчик, который позволяет пользователю сразу набрать 'диспетчерская' и попасть в диспетчерскую после проверки роли."""
+    from control_room.control_room import ControlRoom
+    control = ControlRoom()
+    await control.start(update, context)
 
 async def news_message(update, context):
     await update.message.reply_text("Новости: Здесь будут последние новости организации.")
@@ -140,6 +145,8 @@ def main():
 
     # Добавляем обработчик сообщений с фильтром на текст "админ"
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'(?i)админ'), admin_message))
+    # Добавляем обработчик для быстрого доступа в диспетчерскую по слову 'диспетчерская'
+    application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'(?i)^\s*диспетчерская\s*$'), control_entry))
     # Добавляем обработчик для получения идентификатора пользователя
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'(?i)получить идентификатор'), get_user_id_message))
     # Добавляем обработчик для выбора действия админа
@@ -147,7 +154,12 @@ def main():
     # CallbackQuery для inline-кнопок (фильтрация / пагинация)
     from db.sort_and_filtr import SortAndFiltr
     sortfiltr = SortAndFiltr()
-    application.add_handler(CallbackQueryHandler(sortfiltr.handle_callback))
+    # CallbackQuery для sort_and_filtr — фильтровать только callback'ы, начинающиеся с 'sortfiltr:'
+    application.add_handler(CallbackQueryHandler(sortfiltr.handle_callback, pattern=r'^sortfiltr:'))
+    # CallbackQuery для диспетчерской (InlineKeyboard) — фильтровать только 'control:'
+    from control_room.control_room import ControlRoom
+    control = ControlRoom()
+    application.add_handler(CallbackQueryHandler(control.handle_callback, pattern=r'^control:'))
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'(?i)новости'), news_message))
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'(?i)фото'), photo_message))
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'(?i)видео'), video_message))

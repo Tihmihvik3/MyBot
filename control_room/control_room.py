@@ -1,5 +1,6 @@
 from db.database import Database
 from verification_id import VerificationID
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 
 class ControlRoom:
@@ -68,9 +69,20 @@ class ControlRoom:
                 await update.message.reply_text(full_msg)
 
                 # Инструкции для дальнейших действий
-                await update.message.reply_text('Введите номер записи для удаления/редактирования, 0 — создать запись, 00 — обновить список.')
-                # Устанавливаем флаг ожидания выбора записи
+                await update.message.reply_text('Нажмите кнопку нужной записи или используйте кнопки ниже. Также доступны: Создать, Обновить.')
+                # Устанавливаем флаг ожидания выбора записи (на случай текстового ввода)
                 context.user_data['control_room_awaiting_choice'] = True
+                # Отправим InlineKeyboard с кнопками для каждой записи и служебными кнопками
+                kb = []
+                for i in range(1, len(ids) + 1):
+                    kb.append([InlineKeyboardButton(f"Открыть {i}", callback_data=f"control:open:{i}")])
+                # Add control buttons
+                kb.append([
+                    InlineKeyboardButton('Создать', callback_data='control:create'),
+                    InlineKeyboardButton('Обновить', callback_data='control:refresh')
+                ])
+                markup = InlineKeyboardMarkup(kb)
+                await update.message.reply_text('Управление:', reply_markup=markup)
         except Exception as e:
             await update.message.reply_text(f'Ошибка доступа к базе данных: {e}')
 
@@ -259,6 +271,143 @@ class ControlRoom:
             return True
 
         return False
+
+    async def handle_callback(self, update, context):
+        """Обработчик CallbackQuery для InlineKeyboard диспетчерской."""
+        query = update.callback_query
+        data = query.data
+        await query.answer()
+        # Формат данных: control:<action>:<params...>
+        parts = data.split(':')
+        if not parts or parts[0] != 'control':
+            return
+        action = parts[1] if len(parts) > 1 else ''
+        if action == 'open' and len(parts) >= 3:
+            try:
+                idx = int(parts[2])
+            except Exception:
+                await query.edit_message_text('Некорректный номер записи.')
+                return
+            ids = context.user_data.get('control_room_rows_ids', [])
+            if not ids or idx < 1 or idx > len(ids):
+                await query.edit_message_text('Неверный индекс записи.')
+                return
+            row_id = ids[idx - 1]
+            # Получим полную запись
+            with self.db.get_cursor() as cur:
+                cur.execute('SELECT id, date, where_from, departure_time, "where", arrival_time, customer, phone FROM chart WHERE id = ?', (row_id,))
+                row = cur.fetchone()
+            if not row:
+                await query.edit_message_text('Запись не найдена.')
+                return
+            # Сформируем текст с дружественными названиями
+            keys = ['date','where_from','departure_time','where','arrival_time','customer','phone']
+            text_lines = []
+            for k, val in zip(keys, row[1:]):
+                label = self.FIELD_LABELS.get(k, k)
+                text_lines.append(f"{label}: {val if val is not None else ''}")
+            text = '\n'.join(text_lines)
+            # Inline buttons: Edit, Delete, Back
+            kb = [
+                [InlineKeyboardButton('Редактировать', callback_data=f'control:edit:{idx}') , InlineKeyboardButton('Удалить', callback_data=f'control:delete:{idx}')],
+                [InlineKeyboardButton('Назад', callback_data='control:refresh')]
+            ]
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
+            return
+        if action == 'create':
+            # Запустить текстовый поток создания
+            context.user_data.pop('control_room_awaiting_choice', None)
+            await query.message.reply_text('Запуск создания заявки.')
+            await self.start_create(query.message, context)
+            return
+        if action == 'refresh':
+            # Повторно показать список
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
+            await self.start(query.message, context)
+            return
+        if action == 'delete' and len(parts) >= 3:
+            try:
+                idx = int(parts[2])
+            except Exception:
+                await query.edit_message_text('Некорректный номер для удаления.')
+                return
+            # Попросим подтверждение
+            kb = [[InlineKeyboardButton('Да', callback_data=f'control:delete_confirm:{idx}'), InlineKeyboardButton('Нет', callback_data='control:refresh')]]
+            await query.edit_message_text('Подтвердите удаление записи.', reply_markup=InlineKeyboardMarkup(kb))
+            return
+        if action == 'delete_confirm' and len(parts) >= 3:
+            try:
+                idx = int(parts[2])
+            except Exception:
+                await query.edit_message_text('Некорректный номер для удаления.')
+                return
+            ids = context.user_data.get('control_room_rows_ids', [])
+            if not ids or idx < 1 or idx > len(ids):
+                await query.edit_message_text('Неверный индекс для удаления.')
+                return
+            row_id = ids[idx - 1]
+            with self.db.get_cursor() as cur:
+                cur.execute('DELETE FROM chart WHERE id = ?', (row_id,))
+            await query.edit_message_text('Запись удалена.')
+            # Обновим список
+            await self.start(query.message, context)
+            return
+        if action == 'edit' and len(parts) >= 3:
+            try:
+                idx = int(parts[2])
+            except Exception:
+                await query.edit_message_text('Некорректный номер для редактирования.')
+                return
+            ids = context.user_data.get('control_room_rows_ids', [])
+            if not ids or idx < 1 or idx > len(ids):
+                await query.edit_message_text('Неверный индекс для редактирования.')
+                return
+            # Показать список полей как InlineKeyboard
+            kb = []
+            for i, f in enumerate(self.fields, 1):
+                key = f[0]
+                label = self.FIELD_LABELS.get(key, key)
+                kb.append([InlineKeyboardButton(f"{i}. {label}", callback_data=f'control:field:{idx}:{i}')])
+            kb.append([InlineKeyboardButton('Отмена', callback_data='control:refresh')])
+            await query.edit_message_text('Выберите поле для редактирования:', reply_markup=InlineKeyboardMarkup(kb))
+            return
+        if action == 'field' and len(parts) >= 4:
+            try:
+                idx = int(parts[2])
+                field_idx = int(parts[3])
+            except Exception:
+                await query.edit_message_text('Некорректные параметры.')
+                return
+            ids = context.user_data.get('control_room_rows_ids', [])
+            if not ids or idx < 1 or idx > len(ids):
+                await query.edit_message_text('Неверный индекс записи.')
+                return
+            if field_idx < 1 or field_idx > len(self.fields):
+                await query.edit_message_text('Неверный индекс поля.')
+                return
+            field_key = self.fields[field_idx - 1][0]
+            # Установим состояние ожидания нового значения и запомним выбранную запись/поле
+            context.user_data['control_room_selected_index'] = idx
+            context.user_data['control_room_edit_field'] = field_key
+            context.user_data['control_room_awaiting_new_value'] = True
+            # Получим текущее значение
+            row_id = ids[idx - 1]
+            col_name = f'"{field_key}"' if field_key == 'where' else field_key
+            current_val = ''
+            try:
+                with self.db.get_cursor() as cursor:
+                    cursor.execute(f'SELECT {col_name} FROM chart WHERE id = ?', (row_id,))
+                    r = cursor.fetchone()
+                    if r and r[0] is not None:
+                        current_val = str(r[0])
+            except Exception:
+                current_val = ''
+            label = self.FIELD_LABELS.get(field_key, field_key)
+            await query.edit_message_text(f'Текущее значение для "{label}": {current_val}\nОтправьте новое значение в чат.')
+            return
 
     # --- Создание новой заявки (пошаговый ввод) ---
     fields = [
