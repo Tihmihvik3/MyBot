@@ -1,5 +1,5 @@
 from telegram import ReplyKeyboardMarkup
-from telegram.ext import Application, MessageHandler, CommandHandler, filters
+from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, filters
 import settings
 import logging
 from db.models import User
@@ -53,6 +53,12 @@ async def admin_action_handler(update, context):
     """
     from db.sort_and_filtr import SortAndFiltr
     sortfiltr = SortAndFiltr()
+    # --- Делегируем обработку состояния ControlRoom ---
+    from control_room.control_room import ControlRoom
+    control = ControlRoom()
+    processed = await control.process_state(update, context)
+    if processed:
+        return
     # --- Делегируем обработку состояний SortAndFiltr в модуль sort_and_filtr.py ---
     processed = await sortfiltr.process_state(update, context)
     if processed:
@@ -97,6 +103,9 @@ async def admin_action_handler(update, context):
         # Если выбрано "6" — запуск сортировки и фильтра
         elif update.message.text.strip() == '6':
             await sortfiltr.start(update, context)
+        # Если введено слово 'диспетчерская' (без учета регистра) — перейти в ControlRoom
+        elif update.message.text.strip().lower() == 'диспетчерская':
+            await control.start(update, context)
         else:
                 await work_db.handle_admin_action(update, context)
 
@@ -135,6 +144,10 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'(?i)получить идентификатор'), get_user_id_message))
     # Добавляем обработчик для выбора действия админа
     application.add_handler(MessageHandler(filters.TEXT & (~filters.Regex(r'(?i)админ')), admin_action_handler))
+    # CallbackQuery для inline-кнопок (фильтрация / пагинация)
+    from db.sort_and_filtr import SortAndFiltr
+    sortfiltr = SortAndFiltr()
+    application.add_handler(CallbackQueryHandler(sortfiltr.handle_callback))
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'(?i)новости'), news_message))
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'(?i)фото'), photo_message))
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'(?i)видео'), video_message))
