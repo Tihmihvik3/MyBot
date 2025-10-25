@@ -91,7 +91,20 @@ class EditDB:
         elif results:
             row = results[0]
         if row:
-            await update.message.reply_text(f'Текущее значение поля "{field_name}": {row[idx]}\nВведите новое значение:')
+            # Форматирование даты в виде DD.MM.YYYY для полей с датами
+            display_val = ''
+            try:
+                display_val = row[idx] if row[idx] is not None else ''
+            except Exception:
+                display_val = ''
+            if display_val and 'Дата' in field_name:
+                try:
+                    from datetime import datetime
+                    dt = datetime.strptime(display_val, '%Y-%m-%d')
+                    display_val = dt.strftime('%d.%m.%Y')
+                except Exception:
+                    pass
+            await update.message.reply_text(f'Текущее значение поля "{field_name}": {display_val}\nВведите новое значение:')
             context.user_data['editdb_awaiting_new_value'] = {'field': db_field, 'rowid': row[0], 'field_name': field_name}
             context.user_data['editdb_awaiting_field'] = False  # <--- Сброс ожидания выбора поля
         else:
