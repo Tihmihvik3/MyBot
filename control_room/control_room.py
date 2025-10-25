@@ -1,6 +1,8 @@
 from db.database import Database
 from verification_id import VerificationID
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from datetime import date, timedelta
+import re
 
 
 class ControlRoom:
@@ -183,6 +185,20 @@ class ControlRoom:
                 await self.start(update, context)
                 return True
             row_id = ids[sel - 1]
+            # Если редактируем дату — провалидируем и запретим прошлые даты
+            if field == 'date':
+                parsed = self._parse_date_text(new_value)
+                if not parsed:
+                    await update.message.reply_text('Неверный формат даты. Введите YYYY-MM-DD или DD.MM.YYYY или используйте кнопки.')
+                    kb = self._build_quickdate_markup()
+                    await update.message.reply_text('Выберите дату:', reply_markup=kb)
+                    return True
+                if self._is_past_date(parsed):
+                    await update.message.reply_text('Выбранная дата в прошлом. Укажите текущую или будущую дату.')
+                    kb = self._build_quickdate_markup()
+                    await update.message.reply_text('Выберите дату:', reply_markup=kb)
+                    return True
+                new_value = parsed.isoformat()
             # Подготовим имя столбца с экранированием, если нужно
             col_name = f'"{field}"' if field == 'where' else field
             try:
@@ -318,15 +334,81 @@ class ControlRoom:
             # Запустить текстовый поток создания
             context.user_data.pop('control_room_awaiting_choice', None)
             await query.message.reply_text('Запуск создания заявки.')
-            await self.start_create(query.message, context)
+            # Передаём весь Update (с callback_query) — start_create ожидает Update-like объект
+            await self.start_create(update, context)
             return
+        if action == 'quickdate' and len(parts) >= 3:
+            token = parts[2]
+            # Если в процессе создания — установим значение и продвинем шаг
+            if context.user_data.get('control_room_create_in_progress'):
+                # Текущий шаг должен быть date
+                step = context.user_data.get('control_room_create_step', 0)
+                key = self.fields[step][0]
+                if key != 'date':
+                    await query.answer('Неожиданный выбор даты')
+                    return
+                if token == 'manual':
+                    # Попросим пользователя ввести дату вручную (будет обработано handle_create_step)
+                    await query.message.reply_text('Введите дату в формате YYYY-MM-DD или DD.MM.YYYY:')
+                    return
+                chosen = None
+                if token == 'today':
+                    chosen = date.today()
+                elif token == 'tomorrow':
+                    chosen = date.today() + timedelta(days=1)
+                elif token == 'plus2':
+                    chosen = date.today() + timedelta(days=2)
+                else:
+                    await query.answer('Неизвестная опция даты')
+                    return
+                iso = chosen.isoformat()
+                # Сохраним и продвинем шаг
+                await query.message.reply_text(f'Выбрана дата: {iso}')
+                await self._advance_create_with_value(update, context, iso)
+                return
+            # Если ожидается новое значение при редактировании
+            if context.user_data.get('control_room_awaiting_new_value') and context.user_data.get('control_room_edit_field') == 'date':
+                token = parts[2]
+                if token == 'manual':
+                    await query.message.reply_text('Введите дату в формате YYYY-MM-DD или DD.MM.YYYY:')
+                    return
+                if token == 'today':
+                    chosen = date.today()
+                elif token == 'tomorrow':
+                    chosen = date.today() + timedelta(days=1)
+                elif token == 'plus2':
+                    chosen = date.today() + timedelta(days=2)
+                else:
+                    await query.answer('Неизвестная опция даты')
+                    return
+                iso = chosen.isoformat()
+                # Выполним UPDATE
+                sel = context.user_data.get('control_room_selected_index')
+                ids = context.user_data.get('control_room_rows_ids', [])
+                if not ids or sel is None or sel < 1 or sel > len(ids):
+                    await query.message.reply_text('Ошибка состояния. Попробуйте снова.')
+                    return
+                row_id = ids[sel - 1]
+                col_name = '"date"' if 'date' == 'where' else 'date'
+                try:
+                    with self.db.get_cursor() as cur:
+                        cur.execute(f'UPDATE chart SET {col_name} = ? WHERE id = ?', (iso, row_id))
+                    await query.message.reply_text('Значение обновлено.')
+                except Exception as e:
+                    await query.message.reply_text(f'Ошибка при обновлении: {e}')
+                # очистим флаги и обновим список
+                for k in ('control_room_awaiting_new_value','control_room_edit_field','control_room_selected_index'):
+                    context.user_data.pop(k, None)
+                await self.start(update, context)
+                return
         if action == 'refresh':
             # Повторно показать список
             try:
                 await query.message.delete()
             except Exception:
                 pass
-            await self.start(query.message, context)
+            # Передаём Update, а не Message
+            await self.start(update, context)
             return
         if action == 'delete' and len(parts) >= 3:
             try:
@@ -352,8 +434,8 @@ class ControlRoom:
             with self.db.get_cursor() as cur:
                 cur.execute('DELETE FROM chart WHERE id = ?', (row_id,))
             await query.edit_message_text('Запись удалена.')
-            # Обновим список
-            await self.start(query.message, context)
+            # Обновим список (передаём Update)
+            await self.start(update, context)
             return
         if action == 'edit' and len(parts) >= 3:
             try:
@@ -406,7 +488,12 @@ class ControlRoom:
             except Exception:
                 current_val = ''
             label = self.FIELD_LABELS.get(field_key, field_key)
-            await query.edit_message_text(f'Текущее значение для "{label}": {current_val}\nОтправьте новое значение в чат.')
+            # Если редактируем поле даты, покажем quickdate-кнопки и текущее значение
+            if field_key == 'date':
+                kb = self._build_quickdate_markup()
+                await query.edit_message_text(f'Текущее значение для "{label}": {current_val}\nВыберите новую дату:', reply_markup=kb)
+            else:
+                await query.edit_message_text(f'Текущее значение для "{label}": {current_val}\nОтправьте новое значение в чат.')
             return
 
     # --- Создание новой заявки (пошаговый ввод) ---
@@ -435,19 +522,46 @@ class ControlRoom:
         context.user_data['control_room_create_step'] = 0
         context.user_data['control_room_create_in_progress'] = True
         # Задаём первое приглашение
-        await update.message.reply_text(self.fields[0][1])
+        # Используем message из callback_query, если создаём через InlineKeyboard
+        msg = update.callback_query.message if getattr(update, 'callback_query', None) else update.message
+        await msg.reply_text(self.fields[0][1])
+        # Если первое поле — дата, покажем quick-date клавиатуру
+        first_key = self.fields[0][0]
+        if first_key == 'date':
+            kb = self._build_quickdate_markup()
+            await msg.reply_text('Выберите дату:', reply_markup=kb)
 
     async def handle_create_step(self, update, context):
         step = context.user_data.get('control_room_create_step', 0)
         data = context.user_data.get('control_room_create_data', {})
         value = update.message.text.strip()
         key = self.fields[step][0]
+        # Если поле — дата, проверим формат и что дата не в прошлом
+        if key == 'date':
+            parsed = self._parse_date_text(value)
+            if not parsed:
+                await update.message.reply_text('Неверный формат даты. Введите в формате YYYY-MM-DD или DD.MM.YYYY, либо выберите кнопку.')
+                kb = self._build_quickdate_markup()
+                await update.message.reply_text('Выберите дату:', reply_markup=kb)
+                return
+            if self._is_past_date(parsed):
+                await update.message.reply_text('Выбранная дата в прошлом. Пожалуйста, укажите текущую или будущую дату.')
+                kb = self._build_quickdate_markup()
+                await update.message.reply_text('Выберите дату:', reply_markup=kb)
+                return
+            value = parsed.isoformat()
+
         data[key] = value
         context.user_data['control_room_create_data'] = data
         step += 1
         if step < len(self.fields):
             context.user_data['control_room_create_step'] = step
             await update.message.reply_text(self.fields[step][1])
+            # Если следующее поле — дата, покажем клавиатуру
+            next_key = self.fields[step][0]
+            if next_key == 'date':
+                kb = self._build_quickdate_markup()
+                await update.message.reply_text('Выберите дату:', reply_markup=kb)
             return
 
         # Все поля собраны — вставляем запись в таблицу chart
@@ -475,3 +589,88 @@ class ControlRoom:
             await self.start(update, context)
         except Exception as e:
             await update.message.reply_text(f'Ошибка при сохранении заявки: {e}')
+
+    async def _advance_create_with_value(self, update, context, value: str):
+        """Вставить value в текущее поле создания и продвинуть шаг (вызывается для quickdate)."""
+        step = context.user_data.get('control_room_create_step', 0)
+        data = context.user_data.get('control_room_create_data', {})
+        key = self.fields[step][0]
+        data[key] = value
+        context.user_data['control_room_create_data'] = data
+        step += 1
+        # Определим объект message для ответов (в зависимости от того, вызвано ли из callback)
+        msg = None
+        if getattr(update, 'callback_query', None):
+            msg = update.callback_query.message
+        else:
+            msg = update.message
+
+        if step < len(self.fields):
+            context.user_data['control_room_create_step'] = step
+            await msg.reply_text(self.fields[step][1])
+            # Если следующее поле — дата, покажем клавиатуру
+            next_key = self.fields[step][0]
+            if next_key == 'date':
+                kb = self._build_quickdate_markup()
+                await msg.reply_text('Выберите дату:', reply_markup=kb)
+            return
+
+        # Все поля собраны — вставляем запись в таблицу chart
+        try:
+            with self.db.get_cursor() as cursor:
+                cursor.execute(
+                    'INSERT INTO chart (date, where_from, departure_time, "where", arrival_time, customer, phone) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                    (
+                        data.get('date', ''),
+                        data.get('where_from', ''),
+                        data.get('departure_time', ''),
+                        data.get('where', ''),
+                        data.get('arrival_time', ''),
+                        data.get('customer', ''),
+                        data.get('phone', '')
+                    )
+                )
+            await msg.reply_text('Заявка успешно создана.')
+            # Очистим флаги создания
+            for k in ('control_room_create_data','control_room_create_step','control_room_create_in_progress'):
+                context.user_data.pop(k, None)
+            # Показать обновлённый список
+            await self.start(update, context)
+        except Exception as e:
+            await msg.reply_text(f'Ошибка при сохранении заявки: {e}')
+
+    def _build_quickdate_markup(self):
+        buttons = [
+            [InlineKeyboardButton('Сегодня', callback_data='control:quickdate:today'), InlineKeyboardButton('Завтра', callback_data='control:quickdate:tomorrow')],
+            [InlineKeyboardButton('Через 2 дня', callback_data='control:quickdate:plus2'), InlineKeyboardButton('Ввести вручную', callback_data='control:quickdate:manual')],
+            [InlineKeyboardButton('Отмена', callback_data='control:refresh')]
+        ]
+        return InlineKeyboardMarkup(buttons)
+
+    def _parse_date_text(self, text: str):
+        text = text.strip().lower()
+        if text in ('сегодня', 'today'):
+            return date.today()
+        if text in ('завтра', 'tomorrow'):
+            return date.today() + timedelta(days=1)
+        # YYYY-MM-DD
+        m = re.match(r'^(\d{4})-(\d{1,2})-(\d{1,2})$', text)
+        if m:
+            y, mo, d = map(int, m.groups())
+            try:
+                return date(y, mo, d)
+            except Exception:
+                return None
+        # DD.MM.YYYY
+        m = re.match(r'^(\d{1,2})\.(\d{1,2})\.(\d{4})$', text)
+        if m:
+            d, mo, y = map(int, m.groups())
+            try:
+                return date(y, mo, d)
+            except Exception:
+                return None
+        return None
+
+    def _is_past_date(self, d: date) -> bool:
+        today = date.today()
+        return d < today
