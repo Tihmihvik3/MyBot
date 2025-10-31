@@ -1,4 +1,4 @@
-from telegram import ReplyKeyboardMarkup
+from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, filters
 import settings
 import logging
@@ -13,12 +13,12 @@ logging.basicConfig(filename='bot.log', level=logging.INFO, format='%(asctime)s 
 
 async def start_command(update, context):
     # Ответ на команду /start с кнопками
-    keyboard = [["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"],
-               ["Новости", "Фото"], ["Видео", "Контакты"], ["Справка"]]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    # Клавиатура (используется, когда нужно показать пользователю), но по умолчанию скрыта
+    keyboard = [["Новости", "Фото"], ["Видео", "Контакты"], ["Справка", "ДП"]]
+    # Не показываем клавиатуру по умолчанию — скрываем кнопки
     await update.message.reply_text(
         "Добро пожаловать! Я бот Анжеро-Судженской МО ВОС. Чем могу помочь?",
-        reply_markup=reply_markup
+        reply_markup=ReplyKeyboardRemove()
     )
 
 async def greet_user(update, context):
@@ -28,6 +28,13 @@ async def greet_user(update, context):
 async def help_message(update, context):
     # Ответ на сообщение "справка"
     await update.message.reply_text("Справка: Этот бот может отвечать на команды и сообщения, такие как 'привет' и 'справка'.")
+
+
+async def show_menu_command(update, context):
+    # Показать главное меню (ReplyKeyboardMarkup)
+    keyboard = [["Новости", "Фото"], ["Видео", "Контакты"], ["Справка", "ДП"]]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    await update.message.reply_text('Главное меню:', reply_markup=reply_markup)
 
 async def contact_message(update, context):
     # Ответ на сообщение "контакты"
@@ -147,6 +154,11 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'(?i)админ'), admin_message))
     # Добавляем обработчик для быстрого доступа в диспетчерскую по слову 'диспетчерская'
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'(?i)^\s*диспетчерская\s*$'), control_entry))
+    # Добавляем обработчик для кнопки 'ДП' (аналогично слову 'диспетчерская')
+    application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'(?i)^\s*дп\s*$'), control_entry))
+    # Команда и кнопка для показа главного меню
+    application.add_handler(CommandHandler('menu', show_menu_command))
+    application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'(?i)^\s*меню\s*$'), show_menu_command))
     # Добавляем обработчик для получения идентификатора пользователя
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'(?i)получить идентификатор'), get_user_id_message))
     # Добавляем обработчик для выбора действия админа
@@ -163,9 +175,7 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'(?i)новости'), news_message))
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'(?i)фото'), photo_message))
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'(?i)видео'), video_message))
-    # Обработчики для цифровых кнопок 1-9
-    for i in range(1, 10):
-        application.add_handler(MessageHandler(filters.TEXT & filters.Regex(fr'^\s*{i}\s*$'), number_message))
+    # Цифровой ряд больше не используется — обработчики удалены
 
     logging.info("Бот стартовал")
 

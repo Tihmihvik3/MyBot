@@ -38,6 +38,7 @@ class ControlRoom:
                         departure_time TEXT,
                         "where" TEXT,
                         arrival_time TEXT,
+                        departure_datetime TEXT,
                         customer TEXT,
                         phone TEXT
                     )
@@ -49,9 +50,58 @@ class ControlRoom:
                     context.user_data['control_room_wait_create'] = True
                     return
 
-                # Если таблица существует — вывести все записи (только id, date и departure_time для компактного списка)
-                # Сортируем по дате и времени отправления
-                cursor.execute('SELECT id, date, departure_time FROM chart ORDER BY date ASC, departure_time ASC')
+                # Если таблица существует — вывести все записи (компактный список: id, date, departure_time, where_from)
+                # Сортируем по дате, а для одинаковых дат — по времени отправления
+                # Перед выборкой убедимся, что поле departure_datetime существует и при необходимости выполним миграцию
+                try:
+                    cursor.execute("PRAGMA table_info(chart)")
+                    cols = [r[1] for r in cursor.fetchall()]
+                except Exception:
+                    cols = []
+                if 'departure_datetime' not in cols:
+                    try:
+                        cursor.execute("ALTER TABLE chart ADD COLUMN departure_datetime TEXT")
+                    except Exception:
+                        # старые sqlite не позволяли ALTER ADD; проигнорируем если не удалось
+                        pass
+                    # Попробуем заполнить новое поле на основе date и departure_time
+                    try:
+                        cursor.execute("SELECT id, date, departure_time FROM chart")
+                        all_rows = cursor.fetchall()
+                        for rr in all_rows:
+                            rid, dval, tval = rr[0], rr[1], rr[2]
+                            if dval and tval:
+                                dt_comb = None
+                                try:
+                                    tnorm = self._normalize_time(tval)
+                                    if tnorm:
+                                        dt_comb = f"{dval} {tnorm}:00"
+                                except Exception:
+                                    dt_comb = None
+                                if dt_comb:
+                                    cursor.execute('UPDATE chart SET departure_datetime = ? WHERE id = ?', (dt_comb, rid))
+                    except Exception:
+                        self.logger.exception('Не удалось заполнить departure_datetime для существующих записей')
+                    try:
+                        cursor.execute('CREATE INDEX IF NOT EXISTS idx_chart_departure_datetime ON chart(departure_datetime)')
+                    except Exception:
+                        self.logger.exception('Не удалось создать индекс idx_chart_departure_datetime')
+                # Выполняем основную выборку (включая where_from для отображения адреса)
+                # Удалим просроченные заявки: если поле date заполнено и меньше текущей даты
+                try:
+                    today_iso = date.today().isoformat()
+                    # Условие сравнения для ISO-строк корректно работает в SQLite
+                    cursor.execute('DELETE FROM chart WHERE date IS NOT NULL AND date <> "" AND date < ?', (today_iso,))
+                    try:
+                        deleted = cursor.rowcount
+                    except Exception:
+                        deleted = None
+                    if deleted:
+                        self.logger.info(f'Удалено просроченных заявок: {deleted}')
+                except Exception:
+                    self.logger.exception('Ошибка при удалении просроченных заявок')
+
+                cursor.execute('SELECT id, date, departure_time, where_from FROM chart ORDER BY date ASC, departure_time ASC')
                 rows = cursor.fetchall()
                 if not rows:
                     msg = update.callback_query.message if getattr(update, 'callback_query', None) else update.message
@@ -88,6 +138,7 @@ class ControlRoom:
                     global_idx = i + 1
                     date_val = r[1] if r[1] is not None else ''
                     depart_val = r[2] if r[2] is not None else ''
+                    where_from_val = r[3] if len(r) > 3 and r[3] is not None else ''
                     if date_val:
                         try:
                             from datetime import datetime
@@ -97,7 +148,8 @@ class ControlRoom:
                             date_disp = date_val
                     else:
                         date_disp = ''
-                    label = f"{global_idx}. {date_disp} | {depart_val}"
+                    # Показываем в списке: индекс. Дата | Время отправления | Адрес отправления
+                    label = f"{global_idx}. {date_disp} | {depart_val} | {where_from_val}"
                     if len(label) > 63:
                         label = label[:60] + '...'
                     kb.append([InlineKeyboardButton(label, callback_data=f"control:open:{global_idx}")])
@@ -141,10 +193,61 @@ class ControlRoom:
         """
         # Определим объект message — если вызов из CallbackQuery, используем callback_query.message
         msg = update.callback_query.message if getattr(update, 'callback_query', None) else update.message
+        # Если показан список членов и пользователь ввёл номер — считать как номер страницы (приоритет над созданием)
+        if context.user_data.get('control_room_showing_members'):
+            text = msg.text.strip()
+            # Если сообщение — число, переключаем страницу членов
+            if text.isdigit():
+                try:
+                    page_num = int(text)
+                except Exception:
+                    await msg.reply_text('Введите корректный номер страницы.')
+                    return True
+                if page_num <= 0:
+                    await msg.reply_text('Номер страницы должен быть положительным.')
+                    return True
+                page_size = 10
+                # Получим total страниц — из context (если есть) или по запросу
+                total_pages = context.user_data.get('control_room_members_total_pages')
+                if total_pages is None:
+                    # узнаем общее число записей
+                    _, total = self._fetch_members(page=0, page_size=page_size)
+                    total_pages = (total - 1) // page_size + 1 if total > 0 else 1
+                    context.user_data['control_room_members_total_pages'] = total_pages
+                if page_num > total_pages:
+                    await msg.reply_text(f'Нет такой страницы. Всего страниц: {total_pages}')
+                    return True
+                # установить страницу и показать клавиатуру членов
+                context.user_data['control_room_members_page'] = page_num - 1
+                kb = self._build_members_markup(context=context)
+                if kb:
+                    # Попробуем отредактировать ранее сохранённое сообщение со списком членов
+                    stored = context.user_data.get('control_room_members_message')
+                    if stored and getattr(context, 'bot', None):
+                        try:
+                            chat_id, message_id = stored
+                            await context.bot.edit_message_text(f'Список членов — стр. {page_num}/{total_pages}:', chat_id=chat_id, message_id=message_id, reply_markup=kb)
+                            # обновим stored (message_id не меняется)
+                            context.user_data['control_room_members_message'] = (chat_id, message_id)
+                        except Exception:
+                            # fallback: отправим новое сообщение и обновим stored
+                            sent = await msg.reply_text(f'Список членов — стр. {page_num}/{total_pages}:', reply_markup=kb)
+                            if getattr(sent, 'chat', None):
+                                context.user_data['control_room_members_message'] = (sent.chat.id, sent.message_id)
+                    else:
+                        sent = await msg.reply_text(f'Список членов — стр. {page_num}/{total_pages}:', reply_markup=kb)
+                        if getattr(sent, 'chat', None):
+                            context.user_data['control_room_members_message'] = (sent.chat.id, sent.message_id)
+                else:
+                    await msg.reply_text('Список членов пуст.')
+                return True
+
         # Если уже в процессе создания заявки — обработать шаг создания
         if context.user_data.get('control_room_create_in_progress'):
             await self.handle_create_step(update, context)
             return True
+
+        
 
         # Обработка подтверждения удаления
         if context.user_data.get('control_room_awaiting_delete_confirm'):
@@ -256,11 +359,52 @@ class ControlRoom:
                     await msg.reply_text('Выберите дату:', reply_markup=kb)
                     return True
                 new_value = parsed.isoformat()
+            # Если редактируем телефон — нормализуем и провалидируем
+            if field == 'phone':
+                norm_phone = self._validate_phone(new_value)
+                if not norm_phone:
+                    await msg.reply_text('Неверный формат телефона. Введите телефон в формате +7XXXXXXXXXX или 10 цифр.')
+                    return True
+                new_value = norm_phone
             # Подготовим имя столбца с экранированием, если нужно
+            # Защита: разрешённые имена полей — только из описанных в fields
+            allowed_cols = {f[0] for f in self.fields} | {'where_from', 'arrival_time'}
+            if field not in allowed_cols:
+                await msg.reply_text('Недопустимое имя поля для редактирования.')
+                # очистим состояние
+                for k in ('control_room_awaiting_new_value','control_room_edit_field','control_room_selected_index'):
+                    context.user_data.pop(k, None)
+                return True
             col_name = f'"{field}"' if field == 'where' else field
             try:
                 with self.db.get_cursor() as cursor:
-                    cursor.execute(f'UPDATE chart SET {col_name} = ? WHERE id = ?', (new_value, row_id))
+                    # Если редактируем дату — обновим departure_datetime, если возможно
+                    if field == 'date':
+                        # new_value уже в ISO YYYY-MM-DD
+                        cursor.execute('SELECT departure_time FROM chart WHERE id = ?', (row_id,))
+                        r = cursor.fetchone()
+                        cur_time = r[0] if r and len(r) > 0 else None
+                        dep_dt = None
+                        try:
+                            dep_dt = self._build_departure_datetime(new_value, cur_time)
+                        except Exception:
+                            dep_dt = None
+                        cursor.execute(f'UPDATE chart SET {col_name} = ?, departure_datetime = ? WHERE id = ?', (new_value, dep_dt, row_id))
+                    elif field == 'departure_time':
+                        # Нормализуем время при возможности
+                        tnorm = self._normalize_time(new_value)
+                        store_time = tnorm if tnorm else new_value
+                        cursor.execute('SELECT date FROM chart WHERE id = ?', (row_id,))
+                        r = cursor.fetchone()
+                        cur_date = r[0] if r and len(r) > 0 else None
+                        dep_dt = None
+                        try:
+                            dep_dt = self._build_departure_datetime(cur_date, store_time)
+                        except Exception:
+                            dep_dt = None
+                        cursor.execute(f'UPDATE chart SET departure_time = ?, departure_datetime = ? WHERE id = ?', (store_time, dep_dt, row_id))
+                    else:
+                        cursor.execute(f'UPDATE chart SET {col_name} = ? WHERE id = ?', (new_value, row_id))
                 await msg.reply_text('Значение обновлено.')
             except Exception as e:
                 await msg.reply_text(f'Ошибка при обновлении: {e}')
@@ -486,14 +630,74 @@ class ControlRoom:
                 await query.message.reply_text(f'Выбрана дата: {disp}')
                 await self._advance_create_with_value(update, context, iso)
                 return
+            # Если ожидаем новое значение при редактировании поля date
+            if context.user_data.get('control_room_awaiting_new_value') and context.user_data.get('control_room_edit_field') == 'date':
+                if token == 'manual':
+                    await query.message.reply_text('Введите дату в формате YYYY-MM-DD или DD.MM.YYYY:')
+                    return
+                chosen = None
+                if token == 'today':
+                    chosen = date.today()
+                elif token == 'tomorrow':
+                    chosen = date.today() + timedelta(days=1)
+                elif token == 'plus2':
+                    chosen = date.today() + timedelta(days=2)
+                else:
+                    await query.answer('Неизвестная опция даты')
+                    return
+                iso = chosen.isoformat()
+                # Выполним UPDATE для выбранной записи
+                sel = context.user_data.get('control_room_selected_index')
+                ids = context.user_data.get('control_room_rows_ids', [])
+                if not ids or sel is None or sel < 1 or sel > len(ids):
+                    await query.message.reply_text('Ошибка состояния. Попробуйте снова.')
+                    return
+                row_id = ids[sel - 1]
+                try:
+                    with self.db.get_cursor() as cur:
+                        cur.execute('SELECT departure_time FROM chart WHERE id = ?', (row_id,))
+                        r = cur.fetchone()
+                        cur_time = r[0] if r and len(r) > 0 else None
+                        dep_dt = None
+                        try:
+                            dep_dt = self._build_departure_datetime(iso, cur_time)
+                        except Exception:
+                            dep_dt = None
+                        cur.execute('UPDATE chart SET date = ?, departure_datetime = ? WHERE id = ?', (iso, dep_dt, row_id))
+                    await query.message.reply_text('Значение обновлено.')
+                except Exception as e:
+                    await query.message.reply_text(f'Ошибка при обновлении: {e}')
+                # Очистим состояние редактирования и обновим список
+                for k in ('control_room_awaiting_new_value','control_room_edit_field','control_room_selected_index'):
+                    context.user_data.pop(k, None)
+                await self.start(update, context)
+                return
         # Показать весь список членов по запросу: control:members:show
         if action == 'members' and len(parts) >= 3 and parts[2] == 'show':
             try:
+                # Пометим, что мы показали пользователю полный список членов —
+                # ожидаем, что он может ввести номер страницы в чат
+                if context is not None:
+                    context.user_data['control_room_showing_members'] = True
                 kb = self._build_members_markup(context=context)
                 if kb:
-                    await query.edit_message_text('Список членов:', reply_markup=kb)
+                    try:
+                        await query.edit_message_text('Список членов:', reply_markup=kb)
+                        # Сохраним идентификатор сообщения, которое содержит список членов,
+                        # чтобы позже редактировать его вместо отправки нового
+                        if context is not None and getattr(query, 'message', None):
+                            context.user_data['control_room_members_message'] = (query.message.chat.id, query.message.message_id)
+                    except Exception:
+                        # если редактировать не удалось — отправим новое сообщение
+                        msg = query.message
+                        await msg.reply_text('Список членов:', reply_markup=kb)
+                        if context is not None and getattr(msg, 'chat', None):
+                            context.user_data['control_room_members_message'] = (msg.chat.id, msg.message_id)
                 else:
-                    await query.edit_message_text('Список членов пуст.')
+                    try:
+                        await query.edit_message_text('Список членов пуст.')
+                    except Exception:
+                        await query.message.reply_text('Список членов пуст.')
             except Exception:
                 self.logger.exception('Ошибка при показе списка членов')
             return
@@ -508,10 +712,13 @@ class ControlRoom:
                 except Exception:
                     self.logger.exception('Не удалось сообщить об ошибке номера страницы (members)')
                 return
+            # Поддерживаем prev/next и goto (переход на конкретную страницу)
             if direction == 'prev':
                 new_page = cur_page - 1
             elif direction == 'next':
                 new_page = cur_page + 1
+            elif direction == 'goto':
+                new_page = cur_page
             else:
                 return
             total_pages = context.user_data.get('control_room_members_total_pages')
@@ -529,9 +736,22 @@ class ControlRoom:
             try:
                 kb = self._build_members_markup(context=context)
                 if kb:
-                    await query.edit_message_text('Список членов:', reply_markup=kb)
+                    try:
+                        await query.edit_message_text('Список членов:', reply_markup=kb)
+                        # обновим хранение message id
+                        if context is not None and getattr(query, 'message', None):
+                            context.user_data['control_room_members_message'] = (query.message.chat.id, query.message.message_id)
+                    except Exception:
+                        # если редактирование не удалось — отправим новое сообщение
+                        msg = query.message
+                        await msg.reply_text('Список членов:', reply_markup=kb)
+                        if context is not None and getattr(msg, 'chat', None):
+                            context.user_data['control_room_members_message'] = (msg.chat.id, msg.message_id)
                 else:
-                    await query.edit_message_text('Список членов пуст.')
+                    try:
+                        await query.edit_message_text('Список членов пуст.')
+                    except Exception:
+                        await query.message.reply_text('Список членов пуст.')
             except Exception:
                 self.logger.exception('Ошибка при перерисовке списка членов')
             return
@@ -561,6 +781,8 @@ class ControlRoom:
             if context.user_data.get('control_room_create_in_progress'):
                 await query.message.reply_text(f'Выбран заказчик: {full_name}')
                 await self._advance_create_with_value(update, context, full_name)
+                # Свернём режим показа членов после выбора
+                context.user_data.pop('control_room_showing_members', None)
                 return
             # Если ожидаем новое значение при редактировании и редактируем поле customer
             if context.user_data.get('control_room_awaiting_new_value') and context.user_data.get('control_room_edit_field') == 'customer':
@@ -578,46 +800,15 @@ class ControlRoom:
                     await query.message.reply_text(f'Ошибка при обновлении: {e}')
                 for k in ('control_room_awaiting_new_value','control_room_edit_field','control_room_selected_index'):
                     context.user_data.pop(k, None)
+                # Свернём режим показа членов после выбора
+                context.user_data.pop('control_room_showing_members', None)
+                context.user_data.pop('control_room_members_message', None)
                 await self.start(update, context)
                 return
             # Иначе — просто подтвердим выбор
             await query.answer(f'Выбран: {full_name}')
             return
-            # Если ожидается новое значение при редактировании
-            if context.user_data.get('control_room_awaiting_new_value') and context.user_data.get('control_room_edit_field') == 'date':
-                token = parts[2]
-                if token == 'manual':
-                    await query.message.reply_text('Введите дату в формате YYYY-MM-DD или DD.MM.YYYY:')
-                    return
-                if token == 'today':
-                    chosen = date.today()
-                elif token == 'tomorrow':
-                    chosen = date.today() + timedelta(days=1)
-                elif token == 'plus2':
-                    chosen = date.today() + timedelta(days=2)
-                else:
-                    await query.answer('Неизвестная опция даты')
-                    return
-                iso = chosen.isoformat()
-                # Выполним UPDATE
-                sel = context.user_data.get('control_room_selected_index')
-                ids = context.user_data.get('control_room_rows_ids', [])
-                if not ids or sel is None or sel < 1 or sel > len(ids):
-                    await query.message.reply_text('Ошибка состояния. Попробуйте снова.')
-                    return
-                row_id = ids[sel - 1]
-                col_name = '"date"' if 'date' == 'where' else 'date'
-                try:
-                    with self.db.get_cursor() as cur:
-                        cur.execute(f'UPDATE chart SET {col_name} = ? WHERE id = ?', (iso, row_id))
-                    await query.message.reply_text('Значение обновлено.')
-                except Exception as e:
-                    await query.message.reply_text(f'Ошибка при обновлении: {e}')
-                # очистим флаги и обновим список
-                for k in ('control_room_awaiting_new_value','control_room_edit_field','control_room_selected_index'):
-                    context.user_data.pop(k, None)
-                await self.start(update, context)
-                return
+            # (previously there was duplicated date-update handling here; removed as unreachable)
         if action == 'refresh':
             # Повторно показать список
             try:
@@ -626,6 +817,9 @@ class ControlRoom:
             except Exception:
                 # Если редактировать не удалось, пропустим — всё равно покажем новый список
                 pass
+            # При обновлении списка скрываем состояние показа членов
+            if context is not None:
+                context.user_data.pop('control_room_showing_members', None)
             # Затем покажем актуальный список (start сам отправит новое сообщение)
             await self.start(update, context)
             return
@@ -820,8 +1014,26 @@ class ControlRoom:
         try:
             with self.db.get_cursor() as cursor:
                 # Обратите внимание: имя столбца where экранировано двойными кавычками
+                # Построим departure_datetime
+                dep_dt = None
+                try:
+                    dep_dt = self._build_departure_datetime(data.get('date', ''), data.get('departure_time', ''))
+                except Exception:
+                    dep_dt = None
+                # Если есть телефон — попробуем нормализовать
+                phone_val = data.get('phone', '')
+                if phone_val:
+                    try:
+                        norm_phone = self._validate_phone(phone_val)
+                        if norm_phone:
+                            data['phone'] = norm_phone
+                        else:
+                            # если телефон неверный — сохраняем оригинал, но можно оповестить пользователя
+                            pass
+                    except Exception:
+                        pass
                 cursor.execute(
-                    'INSERT INTO chart (date, where_from, departure_time, "where", arrival_time, customer, phone) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                    'INSERT INTO chart (date, where_from, departure_time, "where", arrival_time, customer, phone, departure_datetime) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
                     (
                         data.get('date', ''),
                         data.get('where_from', ''),
@@ -829,7 +1041,8 @@ class ControlRoom:
                         data.get('where', ''),
                         data.get('arrival_time', ''),
                         data.get('customer', ''),
-                        data.get('phone', '')
+                        data.get('phone', ''),
+                        dep_dt
                     )
                 )
             await update.message.reply_text('Заявка успешно создана.')
@@ -876,8 +1089,14 @@ class ControlRoom:
         # Все поля собраны — вставляем запись в таблицу chart
         try:
             with self.db.get_cursor() as cursor:
+                # Построим departure_datetime
+                dep_dt = None
+                try:
+                    dep_dt = self._build_departure_datetime(data.get('date', ''), data.get('departure_time', ''))
+                except Exception:
+                    dep_dt = None
                 cursor.execute(
-                    'INSERT INTO chart (date, where_from, departure_time, "where", arrival_time, customer, phone) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                    'INSERT INTO chart (date, where_from, departure_time, "where", arrival_time, customer, phone, departure_datetime) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
                     (
                         data.get('date', ''),
                         data.get('where_from', ''),
@@ -885,7 +1104,8 @@ class ControlRoom:
                         data.get('where', ''),
                         data.get('arrival_time', ''),
                         data.get('customer', ''),
-                        data.get('phone', '')
+                        data.get('phone', ''),
+                        dep_dt
                     )
                 )
             await msg.reply_text('Заявка успешно создана.')
@@ -905,56 +1125,141 @@ class ControlRoom:
         ]
         return InlineKeyboardMarkup(buttons)
 
-    def _fetch_members(self):
-        """Вернуть список членов (id, surname, name, patronymic), отсортированных по фамилии."""
+    def _normalize_time(self, text: str):
+        """Нормализовать ввод времени в формат HH:MM (24-часовой). Возвращает строку 'HH:MM' или None."""
+        if not text:
+            return None
+        t = text.strip()
+        # Попробуем форматы H:M или H:M:S
+        m = re.match(r'^(\d{1,2}):(\d{1,2})(?::\d{1,2})?$', t)
+        if m:
+            h, mi = m.group(1), m.group(2)
+            try:
+                hh = int(h)
+                mm = int(mi)
+                if 0 <= hh < 24 and 0 <= mm < 60:
+                    return f"{hh:02d}:{mm:02d}"
+            except Exception:
+                return None
+        # Попробуем просто часы 'H' или 'HH'
+        m = re.match(r'^(\d{1,2})$', t)
+        if m:
+            try:
+                hh = int(m.group(1))
+                if 0 <= hh < 24:
+                    return f"{hh:02d}:00"
+            except Exception:
+                return None
+        return None
+
+    def _build_departure_datetime(self, date_iso: str, time_text: str):
+        """Собрать комбинированную дату-время 'YYYY-MM-DD HH:MM:SS' или вернуть None, если не хватает данных."""
+        if not date_iso:
+            return None
+        if not time_text:
+            return None
+        tnorm = self._normalize_time(time_text)
+        if not tnorm:
+            return None
+        # добавим секунды
+        return f"{date_iso} {tnorm}:00"
+
+    def _validate_phone(self, text: str):
+        """Простейшая валидация/нормализация телефона.
+
+        Возвращает строку в формате +7XXXXXXXXXX или None, если невалиден.
+        Правила:
+        - Убираем все нецифровые символы.
+        - Если длина 11 и начинается с '8' или '7' -> нормализуем в +7XXXXXXXXXX.
+        - Если длина 10 -> считаем, что это без кода региона и добавляем +7.
+        - Иначе возвращаем None.
+        """
+        if not text:
+            return None
+        s = re.sub(r"\D", "", text)
+        if len(s) == 11 and s[0] in ('7', '8'):
+            return '+7' + s[-10:]
+        if len(s) == 10:
+            return '+7' + s
+        return None
+
+    def _fetch_members(self, page: int = 0, page_size: int = 10):
+        """Вернуть страницу членов (rows, total_count).
+
+        rows: список кортежей (id, surname, name, patronymic) для запрошенной страницы.
+        total_count: общее количество записей в таблице members.
+        """
         try:
             with self.db.get_cursor() as cur:
-                cur.execute('SELECT id, surname, name, patronymic FROM members ORDER BY surname COLLATE NOCASE ASC')
+                # общее количество
+                cur.execute('SELECT COUNT(*) FROM members')
+                total = cur.fetchone()[0] or 0
+                offset = page * page_size
+                cur.execute(
+                    'SELECT id, surname, name, patronymic FROM members ORDER BY surname COLLATE NOCASE ASC LIMIT ? OFFSET ?',
+                    (page_size, offset)
+                )
                 rows = cur.fetchall()
-                return rows
+                return rows, total
         except Exception:
             self.logger.exception('Ошибка при выборке членов из members')
-            return []
+            return [], 0
 
     def _build_members_markup(self, context=None):
         """Построить InlineKeyboard с пронумерованными членами, поддерживая пагинацию.
 
         Если передан context, читаем/сохраняем текущую страницу в context.user_data['control_room_members_page'].
         """
-        rows = self._fetch_members()
-        if not rows:
-            return None
         page_size = 10
-        total = len(rows)
-        total_pages = (total - 1) // page_size + 1 if total > 0 else 1
         # Получаем страницу из context, если доступно
         page = 0
         if context is not None:
             page = context.user_data.get('control_room_members_page', 0)
         if page < 0:
             page = 0
+        # Подгружаем только требуемую страницу и общее количество
+        rows, total = self._fetch_members(page=page, page_size=page_size)
+        if not rows and total == 0:
+            return None
+        total_pages = (total - 1) // page_size + 1 if total > 0 else 1
+        # Получаем страницу из context, если доступно
         if page >= total_pages:
             page = total_pages - 1
         if context is not None:
             context.user_data['control_room_members_page'] = page
             context.user_data['control_room_members_total_pages'] = total_pages
 
-        start_idx = page * page_size
-        end_idx = min(start_idx + page_size, total)
         kb = []
-        # Пронумерованные глобально
-        for i in range(start_idx, end_idx):
-            r = rows[i]
+        # Пронумерованные глобально: индекс = page*page_size + idx_in_page + 1
+        for idx_in_page, r in enumerate(rows):
             mid = r[0]
             surname = r[1] or ''
             name = r[2] or ''
             patron = r[3] or ''
-            label = f"{i+1}. {surname} {name} {patron}".strip()
+            global_idx = page * page_size + idx_in_page + 1
+            label = f"{global_idx}. {surname} {name} {patron}".strip()
             if len(label) > 63:
                 label = label[:60] + '...'
             kb.append([InlineKeyboardButton(label, callback_data=f'control:member:{mid}')])
 
-        # Навигация по страницам членов
+        # Кнопки с номерами всех страниц (показываем под списком)
+        # Разбиваем номера по рядам, по 8 кнопок в ряд
+        page_buttons = []
+        row = []
+        per_row = 8
+        for p in range(total_pages):
+            label = str(p + 1)
+            # callback содержит целевую страницу (0-based)
+            row.append(InlineKeyboardButton(label, callback_data=f'control:members:goto:{p}'))
+            if len(row) >= per_row:
+                page_buttons.append(row)
+                row = []
+        if row:
+            page_buttons.append(row)
+
+        kb.extend(page_buttons)
+
+        # Навигация по страницам членов (предыдущая/текущая/следующая)
         nav = []
         if page > 0:
             nav.append(InlineKeyboardButton('◀️', callback_data=f'control:members:prev:{page}'))
