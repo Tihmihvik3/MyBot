@@ -4,6 +4,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from datetime import date, timedelta
 import re
 import logging
+from typing import Optional, Tuple, List
 
 
 class ControlRoom:
@@ -13,7 +14,7 @@ class ControlRoom:
         self.db = Database()
         self.logger = logging.getLogger(__name__)
 
-    async def start(self, update, context):
+    async def start(self, update, context) -> None:
         # Проверяем роль пользователя, аналогично admin_message
         verifier = VerificationID()
         role = await verifier.check_role(update, context)
@@ -187,7 +188,7 @@ class ControlRoom:
             self.logger.exception('Ошибка доступа к базе данных')
             await msg.reply_text(f'Ошибка доступа к базе данных: {e}')
 
-    async def process_state(self, update, context):
+    async def process_state(self, update, context) -> bool:
         """Обрабатывает последующие сообщения пользователя в режиме диспетчерской.
         Возвращает True, если сообщение обработано модулем.
         """
@@ -489,7 +490,7 @@ class ControlRoom:
 
         return False
 
-    async def handle_callback(self, update, context):
+    async def handle_callback(self, update, context) -> None:
         """Обработчик CallbackQuery для InlineKeyboard диспетчерской."""
         query = update.callback_query
         data = query.data
@@ -949,7 +950,7 @@ class ControlRoom:
         'phone': 'Телефон'
     }
 
-    async def start_create(self, update, context):
+    async def start_create(self, update, context) -> None:
         context.user_data['control_room_create_data'] = {}
         context.user_data['control_room_create_step'] = 0
         context.user_data['control_room_create_in_progress'] = True
@@ -970,7 +971,7 @@ class ControlRoom:
             ])
             await msg.reply_text('Нажмите, чтобы увидеть список заказчиков:', reply_markup=kb)
 
-    async def handle_create_step(self, update, context):
+    async def handle_create_step(self, update, context) -> None:
         step = context.user_data.get('control_room_create_step', 0)
         data = context.user_data.get('control_room_create_data', {})
         value = update.message.text.strip()
@@ -1055,7 +1056,7 @@ class ControlRoom:
         except Exception as e:
             await update.message.reply_text(f'Ошибка при сохранении заявки: {e}')
 
-    async def _advance_create_with_value(self, update, context, value: str):
+    async def _advance_create_with_value(self, update, context, value: str) -> None:
         """Вставить value в текущее поле создания и продвинуть шаг (вызывается для quickdate)."""
         step = context.user_data.get('control_room_create_step', 0)
         data = context.user_data.get('control_room_create_data', {})
@@ -1117,7 +1118,7 @@ class ControlRoom:
         except Exception as e:
             await msg.reply_text(f'Ошибка при сохранении заявки: {e}')
 
-    def _build_quickdate_markup(self):
+    def _build_quickdate_markup(self) -> InlineKeyboardMarkup:
         buttons = [
             [InlineKeyboardButton('Сегодня', callback_data='control:quickdate:today'), InlineKeyboardButton('Завтра', callback_data='control:quickdate:tomorrow')],
             [InlineKeyboardButton('Через 2 дня', callback_data='control:quickdate:plus2'), InlineKeyboardButton('Ввести вручную', callback_data='control:quickdate:manual')],
@@ -1125,7 +1126,7 @@ class ControlRoom:
         ]
         return InlineKeyboardMarkup(buttons)
 
-    def _normalize_time(self, text: str):
+    def _normalize_time(self, text: str) -> Optional[str]:
         """Нормализовать ввод времени в формат HH:MM (24-часовой). Возвращает строку 'HH:MM' или None."""
         if not text:
             return None
@@ -1152,7 +1153,7 @@ class ControlRoom:
                 return None
         return None
 
-    def _build_departure_datetime(self, date_iso: str, time_text: str):
+    def _build_departure_datetime(self, date_iso: str, time_text: str) -> Optional[str]:
         """Собрать комбинированную дату-время 'YYYY-MM-DD HH:MM:SS' или вернуть None, если не хватает данных."""
         if not date_iso:
             return None
@@ -1164,7 +1165,7 @@ class ControlRoom:
         # добавим секунды
         return f"{date_iso} {tnorm}:00"
 
-    def _validate_phone(self, text: str):
+    def _validate_phone(self, text: str) -> Optional[str]:
         """Простейшая валидация/нормализация телефона.
 
         Возвращает строку в формате +7XXXXXXXXXX или None, если невалиден.
@@ -1183,7 +1184,7 @@ class ControlRoom:
             return '+7' + s
         return None
 
-    def _fetch_members(self, page: int = 0, page_size: int = 10):
+    def _fetch_members(self, page: int = 0, page_size: int = 10) -> Tuple[List[tuple], int]:
         """Вернуть страницу членов (rows, total_count).
 
         rows: список кортежей (id, surname, name, patronymic) для запрошенной страницы.
@@ -1205,7 +1206,7 @@ class ControlRoom:
             self.logger.exception('Ошибка при выборке членов из members')
             return [], 0
 
-    def _build_members_markup(self, context=None):
+    def _build_members_markup(self, context=None) -> Optional[InlineKeyboardMarkup]:
         """Построить InlineKeyboard с пронумерованными членами, поддерживая пагинацию.
 
         Если передан context, читаем/сохраняем текущую страницу в context.user_data['control_room_members_page'].
@@ -1271,7 +1272,7 @@ class ControlRoom:
         kb.append([InlineKeyboardButton('Отмена', callback_data='control:refresh')])
         return InlineKeyboardMarkup(kb)
 
-    def _parse_date_text(self, text: str):
+    def _parse_date_text(self, text: str) -> Optional[date]:
         text = text.strip().lower()
         if text in ('сегодня', 'today'):
             return date.today()
