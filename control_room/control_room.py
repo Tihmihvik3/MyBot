@@ -5,6 +5,7 @@ from datetime import date, timedelta
 import re
 import logging
 from typing import Optional, Tuple, List
+from control_room.create_table import ensure_chart_table
 
 
 class ControlRoom:
@@ -25,68 +26,14 @@ class ControlRoom:
 
         # Убедимся, что есть подключение к БД
         try:
+            # Вынесенная логика проверки/создания таблицы и миграций
+            self.logger.debug('ControlRoom.start: вызов ensure_chart_table')
+            created = await ensure_chart_table(self.db, update, context, self.logger)
+            self.logger.debug(f'ControlRoom.start: ensure_chart_table вернул {created}')
+            if created:
+                # ensure_chart_table уже уведомил пользователя и выставил флаг создания — завершить обработку
+                return
             with self.db.get_cursor() as cursor:
-                # Проверим наличие таблицы chart
-                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='chart'")
-                found = cursor.fetchone()
-                if not found:
-                    # Создадим таблицу chart
-                    cursor.execute('''
-                    CREATE TABLE chart (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        date TEXT,
-                        where_from TEXT,
-                        departure_time TEXT,
-                        "where" TEXT,
-                        arrival_time TEXT,
-                        departure_datetime TEXT,
-                        customer TEXT,
-                        phone TEXT
-                    )
-                    ''')
-                    msg = update.callback_query.message if getattr(update, 'callback_query', None) else update.message
-                    await msg.reply_text('Таблица "chart" не была обнаружена и была создана.')
-                    # После создания таблицы сразу предложим создать запись
-                    await msg.reply_text('Заявок нет. Наберите 0 чтобы создать заявку.')
-                    context.user_data['control_room_wait_create'] = True
-                    return
-
-                # Если таблица существует — вывести все записи (компактный список: id, date, departure_time, where_from)
-                # Сортируем по дате, а для одинаковых дат — по времени отправления
-                # Перед выборкой убедимся, что поле departure_datetime существует и при необходимости выполним миграцию
-                try:
-                    cursor.execute("PRAGMA table_info(chart)")
-                    cols = [r[1] for r in cursor.fetchall()]
-                except Exception:
-                    cols = []
-                if 'departure_datetime' not in cols:
-                    try:
-                        cursor.execute("ALTER TABLE chart ADD COLUMN departure_datetime TEXT")
-                    except Exception:
-                        # старые sqlite не позволяли ALTER ADD; проигнорируем если не удалось
-                        pass
-                    # Попробуем заполнить новое поле на основе date и departure_time
-                    try:
-                        cursor.execute("SELECT id, date, departure_time FROM chart")
-                        all_rows = cursor.fetchall()
-                        for rr in all_rows:
-                            rid, dval, tval = rr[0], rr[1], rr[2]
-                            if dval and tval:
-                                dt_comb = None
-                                try:
-                                    tnorm = self._normalize_time(tval)
-                                    if tnorm:
-                                        dt_comb = f"{dval} {tnorm}:00"
-                                except Exception:
-                                    dt_comb = None
-                                if dt_comb:
-                                    cursor.execute('UPDATE chart SET departure_datetime = ? WHERE id = ?', (dt_comb, rid))
-                    except Exception:
-                        self.logger.exception('Не удалось заполнить departure_datetime для существующих записей')
-                    try:
-                        cursor.execute('CREATE INDEX IF NOT EXISTS idx_chart_departure_datetime ON chart(departure_datetime)')
-                    except Exception:
-                        self.logger.exception('Не удалось создать индекс idx_chart_departure_datetime')
                 # Выполняем основную выборку (включая where_from для отображения адреса)
                 # Удалим просроченные заявки: если поле date заполнено и меньше текущей даты
                 try:
@@ -179,10 +126,17 @@ class ControlRoom:
                     except Exception:
                         msg = update.callback_query.message
                         self.logger.exception('Не удалось отредактировать сообщение списка, отправляем новое')
-                        await msg.reply_text(text, reply_markup=markup)
+                        # Попробуем отправить новое сообщение как fallback
+                        try:
+                            await msg.reply_text(text, reply_markup=markup)
+                        except Exception:
+                            self.logger.exception('Fallback reply_text также не удался')
                 else:
                     msg = update.message
-                    await msg.reply_text(text, reply_markup=markup)
+                    try:
+                        await msg.reply_text(text, reply_markup=markup)
+                    except Exception:
+                        self.logger.exception('Не удалось отправить сообщение списка заявок')
         except Exception as e:
             msg = update.callback_query.message if getattr(update, 'callback_query', None) else update.message
             self.logger.exception('Ошибка доступа к базе данных')
