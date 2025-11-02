@@ -2,6 +2,7 @@ from db.database import Database
 from verification_id import VerificationID
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from datetime import date, timedelta
+import asyncio
 import re
 import logging
 from typing import Optional, Tuple, List
@@ -678,7 +679,8 @@ class ControlRoom:
             for r in rows:
                 aid, addr = r[0], r[1] or ''
                 label = addr if len(addr) <= 63 else addr[:60] + '...'
-                kb.append([InlineKeyboardButton(label, callback_data=f'control:address:{aid}')])
+                # Включаем direction в callback, чтобы при выборе из полного списка направление было явно задано
+                kb.append([InlineKeyboardButton(label, callback_data=f'control:address:{aid}:{direction}')])
             kb.append([InlineKeyboardButton('Отмена', callback_data='control:refresh')])
             try:
                 await query.edit_message_text('Все адреса:', reply_markup=InlineKeyboardMarkup(kb))
@@ -801,6 +803,8 @@ class ControlRoom:
             except Exception:
                 await query.answer('Некорректный выбор')
                 return
+            # Опционально: direction может быть передан в callback как четвертый параметр
+            direction_from_cb = parts[3] if len(parts) >= 4 else None
             # Получим адрес из таблицы
             try:
                 with self.db.get_cursor() as cur:
@@ -817,18 +821,21 @@ class ControlRoom:
             # Если в процессе создания — вставим значение и продвинем шаг
             if context.user_data.get('control_room_create_in_progress'):
                 # Если заранее выбран заказчик — обновим рейтинг привязки.
-                # Определим направление (откуда/куда) на основе текущего шага создания.
+                # Direction: используем переданный в callback, если он есть, иначе вычисляем как раньше на основе шага
                 cust_id = context.user_data.get('control_room_create_customer_id')
                 try:
-                    direction = 'отпр'
-                    if context.user_data.get('control_room_create_in_progress'):
-                        step_idx = context.user_data.get('control_room_create_step', -1)
-                        if 0 <= step_idx < len(self.fields):
-                            current_key = self.fields[step_idx][0]
-                            if current_key == 'where':
-                                direction = 'назн'
-                            elif current_key == 'where_from':
-                                direction = 'отпр'
+                    if direction_from_cb:
+                        direction = direction_from_cb
+                    else:
+                        direction = 'отпр'
+                        if context.user_data.get('control_room_create_in_progress'):
+                            step_idx = context.user_data.get('control_room_create_step', -1)
+                            if 0 <= step_idx < len(self.fields):
+                                current_key = self.fields[step_idx][0]
+                                if current_key == 'where':
+                                    direction = 'назн'
+                                elif current_key == 'where_from':
+                                    direction = 'отпр'
                     if cust_id:
                         try:
                             with self.db.get_cursor() as cur:
@@ -1290,7 +1297,15 @@ class ControlRoom:
                         dep_dt
                     )
                 )
-            await update.message.reply_text('Заявка успешно создана.')
+                sent = await update.message.reply_text('Заявка успешно создана.')
+                # Удалить уведомление через 10 секунд (fire-and-forget задача)
+                try:
+                    bot = getattr(context, 'bot', None)
+                    if bot and getattr(sent, 'chat', None):
+                        asyncio.create_task(self._delete_message_later(bot, sent.chat.id, sent.message_id, 10))
+                except Exception:
+                    # если не удалось планировать задачу — ничего не делаем
+                    pass
             # Очистим флаги создания
             context.user_data.pop('control_room_create_data', None)
             context.user_data.pop('control_room_create_step', None)
@@ -1397,7 +1412,14 @@ class ControlRoom:
                         dep_dt
                     )
                 )
-            await msg.reply_text('Заявка успешно создана.')
+            sent = await msg.reply_text('Заявка успешно создана.')
+            # Удалить уведомление через 10 секунд (fire-and-forget задача)
+            try:
+                bot = getattr(context, 'bot', None)
+                if bot and getattr(sent, 'chat', None):
+                    asyncio.create_task(self._delete_message_later(bot, sent.chat.id, sent.message_id, 10))
+            except Exception:
+                pass
             # Очистим флаги создания
             for k in ('control_room_create_data','control_room_create_step','control_room_create_in_progress'):
                 context.user_data.pop(k, None)
@@ -1471,6 +1493,25 @@ class ControlRoom:
         if len(s) == 10:
             return '+7' + s
         return None
+
+    async def _delete_message_later(self, bot, chat_id: int, message_id: int, delay: int = 10) -> None:
+        """Удалить сообщение через delay секунд. Выполняется как фоновая задача."""
+        try:
+            await asyncio.sleep(delay)
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=message_id)
+            except Exception:
+                # не критично, просто логируем
+                try:
+                    self.logger.exception('Не удалось удалить временное сообщение')
+                except Exception:
+                    pass
+        except Exception:
+            # Если даже sleep или задача упала — ничего не делаем
+            try:
+                self.logger.exception('Ошибка в задаче удаления временного сообщения')
+            except Exception:
+                pass
 
     def _fetch_members(self, page: int = 0, page_size: int = 10) -> Tuple[List[tuple], int]:
         """Вернуть страницу членов (rows, total_count).
@@ -1576,18 +1617,17 @@ class ControlRoom:
                 rows = cur.fetchall()
         except Exception:
             self.logger.exception('Ошибка при выборке адресов для заказчика')
-            return None
-        if not rows:
-            return None
+            # В случае ошибки возвращаем клавиатуру с кнопкой "Показать все" и "Отмена"
+            rows = []
+        # Всегда возвращаем клавиатуру — даже если нет привязанных адресов, чтобы показывать кнопку "Показать все"
         kb = []
         for r in rows:
             aid, addr = r[0], r[1] or ''
             label = addr if len(addr) <= 63 else addr[:60] + '...'
-            kb.append([InlineKeyboardButton(label, callback_data=f'control:address:{aid}')])
-        # Добавим кнопку Показать все (по желанию) и кнопку Отмена
-        if include_show_all:
-            # Параметр direction передаём, чтобы показать, какие адреса нужны при выборе
-            kb.append([InlineKeyboardButton('Показать все', callback_data=f'control:addresses:showall:{direction}')])
+            # Включаем направление в callback, чтобы обработчик получил однозначно нужное направление
+            kb.append([InlineKeyboardButton(label, callback_data=f'control:address:{aid}:{direction}')])
+        # Добавим кнопку Показать все (всегда показываем) и кнопку Отмена
+        kb.append([InlineKeyboardButton('Показать все', callback_data=f'control:addresses:showall:{direction}')])
         kb.append([InlineKeyboardButton('Отмена', callback_data='control:refresh')])
         return InlineKeyboardMarkup(kb)
 
