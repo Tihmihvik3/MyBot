@@ -14,6 +14,37 @@ async def ensure_chart_table(db: Database, update, context, logger: logging.Logg
     try:
         logger.debug('ensure_chart_table: entering, проверяем существование таблицы chart')
         with db.get_cursor() as cursor:
+            def _ensure_addresses_and_customer_tables(cur, logger):
+                """Внутренняя утилита: убедиться, что таблицы addresses и customer_addresse существуют."""
+                try:
+                    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='addresses'")
+                    if not cur.fetchone():
+                        cur.execute('''
+                        CREATE TABLE addresses (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            address TEXT
+                        )
+                        ''')
+                        logger.info('Создана таблица addresses')
+                except Exception:
+                    logger.exception('Ошибка при создании таблицы addresses')
+                try:
+                    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='customer_addresse'")
+                    if not cur.fetchone():
+                        cur.execute('''
+                        CREATE TABLE customer_addresse (
+                            customer_id INTEGER,
+                            addresse_id INTEGER,
+                            direction TEXT,
+                            rating INTEGER,
+                            FOREIGN KEY(customer_id) REFERENCES members(id),
+                            FOREIGN KEY(addresse_id) REFERENCES addresses(id)
+                        )
+                        ''')
+                        logger.info('Создана таблица customer_addresse')
+                except Exception:
+                    logger.exception('Ошибка при создании таблицы customer_addresse')
+
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='chart'")
             found = cursor.fetchone()
             if not found:
@@ -32,6 +63,8 @@ async def ensure_chart_table(db: Database, update, context, logger: logging.Logg
                 ''')
                 msg = update.callback_query.message if getattr(update, 'callback_query', None) else update.message
                 await msg.reply_text('Таблица "chart" не была обнаружена и была создана.')
+                # Создадим связанные таблицы addresses и customer_addresse, если их нет
+                _ensure_addresses_and_customer_tables(cursor, logger)
                 await msg.reply_text('Заявок нет. Наберите 0 чтобы создать заявку.')
                 context.user_data['control_room_wait_create'] = True
                 return True
@@ -78,6 +111,8 @@ async def ensure_chart_table(db: Database, update, context, logger: logging.Logg
                     logger.exception('Не удалось создать индекс idx_chart_departure_datetime')
             else:
                 logger.debug('ensure_chart_table: поле departure_datetime уже присутствует')
+            # Убедимся в наличии таблиц addresses и customer_addresse
+            _ensure_addresses_and_customer_tables(cursor, logger)
     except Exception:
         msg = update.callback_query.message if getattr(update, 'callback_query', None) else update.message
         logger.exception('Ошибка доступа к базе данных при обеспечении таблицы chart')

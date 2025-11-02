@@ -734,6 +734,8 @@ class ControlRoom:
             full_name = ' '.join(parts_name)
             # Если в процессе создания — вставим значение и продвинем шаг
             if context.user_data.get('control_room_create_in_progress'):
+                # Сохраним id выбранного заказчика для последующих привязок адресов
+                context.user_data['control_room_create_customer_id'] = member_id
                 await query.message.reply_text(f'Выбран заказчик: {full_name}')
                 await self._advance_create_with_value(update, context, full_name)
                 # Свернём режим показа членов после выбора
@@ -764,6 +766,60 @@ class ControlRoom:
             await query.answer(f'Выбран: {full_name}')
             return
             # (previously there was duplicated date-update handling here; removed as unreachable)
+        if action == 'address' and len(parts) >= 3:
+            try:
+                addr_id = int(parts[2])
+            except Exception:
+                await query.answer('Некорректный выбор')
+                return
+            # Получим адрес из таблицы
+            try:
+                with self.db.get_cursor() as cur:
+                    cur.execute('SELECT address FROM addresses WHERE id = ?', (addr_id,))
+                    ar = cur.fetchone()
+            except Exception:
+                self.logger.exception('Ошибка при чтении addresses')
+                await query.answer('Ошибка доступа к базе адресов')
+                return
+            if not ar:
+                await query.answer('Адрес не найден')
+                return
+            address_text = ar[0]
+            # Если в процессе создания — вставим значение и продвинем шаг
+            if context.user_data.get('control_room_create_in_progress'):
+                # Если заранее выбран заказчик — обновим рейтинг привязки.
+                # Определим направление (откуда/куда) на основе текущего шага создания.
+                cust_id = context.user_data.get('control_room_create_customer_id')
+                try:
+                    direction = 'отпр'
+                    if context.user_data.get('control_room_create_in_progress'):
+                        step_idx = context.user_data.get('control_room_create_step', -1)
+                        if 0 <= step_idx < len(self.fields):
+                            current_key = self.fields[step_idx][0]
+                            if current_key == 'where':
+                                direction = 'назн'
+                            elif current_key == 'where_from':
+                                direction = 'отпр'
+                    if cust_id:
+                        try:
+                            with self.db.get_cursor() as cur:
+                                cur.execute('SELECT rating FROM customer_addresse WHERE customer_id = ? AND addresse_id = ? AND direction = ?', (cust_id, addr_id, direction))
+                                exists = cur.fetchone()
+                                if exists:
+                                    cur.execute('UPDATE customer_addresse SET rating = rating + 1 WHERE customer_id = ? AND addresse_id = ? AND direction = ?', (cust_id, addr_id, direction))
+                                else:
+                                    cur.execute('INSERT INTO customer_addresse (customer_id, addresse_id, direction, rating) VALUES (?, ?, ?, ?)', (cust_id, addr_id, direction, 1))
+                        except Exception:
+                            self.logger.exception('Ошибка при обновлении рейтинга customer_addresse')
+                except Exception:
+                    self.logger.exception('Ошибка при обработке рейтинга адреса')
+
+                await query.message.reply_text(f'Выбран адрес: {address_text}')
+                await self._advance_create_with_value(update, context, address_text)
+                # Свернём режим показа членов/адресов после выбора
+                context.user_data.pop('control_room_showing_members', None)
+                context.user_data.pop('control_room_members_message', None)
+                return
         if action == 'refresh':
             # Повторно показать список
             try:
@@ -924,6 +980,8 @@ class ControlRoom:
                 [InlineKeyboardButton('Отмена', callback_data='control:refresh')]
             ])
             await msg.reply_text('Нажмите, чтобы увидеть список заказчиков:', reply_markup=kb)
+        # Если следующий ключ будет адрес отправления — предложим список адресов для выбранного заказчика (если есть)
+        # (Сделаем это только после выбора заказчика; при старте тут нет customer yet)
 
     async def handle_create_step(self, update, context) -> None:
         step = context.user_data.get('control_room_create_step', 0)
@@ -945,6 +1003,36 @@ class ControlRoom:
                 return
             value = parsed.isoformat()
 
+        # Если заполняется поле адреса вручную (откуда или куда) — сохранить адрес в таблице addresses
+        if key in ('where_from', 'where'):
+            direction = 'отпр' if key == 'where_from' else 'назн'
+            try:
+                cust_id = context.user_data.get('control_room_create_customer_id')
+                with self.db.get_cursor() as cur:
+                    # Проверим существует ли адрес
+                    cur.execute('SELECT id FROM addresses WHERE address = ?', (value,))
+                    ar = cur.fetchone()
+                    if ar:
+                        addr_id = ar[0]
+                    else:
+                        cur.execute('INSERT INTO addresses (address) VALUES (?)', (value,))
+                        addr_id = cur.lastrowid
+                    # Если есть идентификатор заказчика — обновим/вставим привязку
+                    if cust_id:
+                        cur.execute('SELECT rating FROM customer_addresse WHERE customer_id = ? AND addresse_id = ? AND direction = ?', (cust_id, addr_id, direction))
+                        exists = cur.fetchone()
+                        if exists:
+                            try:
+                                cur.execute('UPDATE customer_addresse SET rating = rating + 1 WHERE customer_id = ? AND addresse_id = ? AND direction = ?', (cust_id, addr_id, direction))
+                            except Exception:
+                                pass
+                        else:
+                            try:
+                                cur.execute('INSERT INTO customer_addresse (customer_id, addresse_id, direction, rating) VALUES (?, ?, ?, ?)', (cust_id, addr_id, direction, 1))
+                            except Exception:
+                                pass
+            except Exception:
+                self.logger.exception('Ошибка при сохранении адреса вручную')
         data[key] = value
         context.user_data['control_room_create_data'] = data
         step += 1
@@ -963,6 +1051,20 @@ class ControlRoom:
                     [InlineKeyboardButton('Отмена', callback_data='control:refresh')]
                 ])
                 await update.message.reply_text('Нажмите, чтобы увидеть список заказчиков:', reply_markup=kb)
+            elif next_key == 'where_from':
+                # Показать список адресов, привязанных к выбранному заказчику (если есть)
+                cust_id = context.user_data.get('control_room_create_customer_id')
+                if cust_id:
+                    kb = self._build_addresses_markup(cust_id)
+                    if kb:
+                        await update.message.reply_text('Выберите адрес отправления:', reply_markup=kb)
+            elif next_key == 'where':
+                # Показать список адресов назначения для выбранного заказчика
+                cust_id = context.user_data.get('control_room_create_customer_id')
+                if cust_id:
+                    kb = self._build_addresses_markup(cust_id, direction='назн')
+                    if kb:
+                        await update.message.reply_text('Выберите адрес назначения:', reply_markup=kb)
             return
 
         # Все поля собраны — вставляем запись в таблицу chart
@@ -1028,7 +1130,7 @@ class ControlRoom:
         if step < len(self.fields):
             context.user_data['control_room_create_step'] = step
             await msg.reply_text(self.fields[step][1])
-            # Если следующее поле — дата, покажем клавиатуру
+            # Если следующее поле — дата/заказчик/откуда — покажем соответствующую клавиатуру
             next_key = self.fields[step][0]
             if next_key == 'date':
                 kb = self._build_quickdate_markup()
@@ -1039,6 +1141,19 @@ class ControlRoom:
                     [InlineKeyboardButton('Отмена', callback_data='control:refresh')]
                 ])
                 await msg.reply_text('Нажмите, чтобы увидеть список заказчиков:', reply_markup=kb)
+            elif next_key == 'where_from':
+                cust_id = context.user_data.get('control_room_create_customer_id')
+                if cust_id:
+                    kb = self._build_addresses_markup(cust_id)
+                    if kb:
+                        await msg.reply_text('Выберите адрес отправления:', reply_markup=kb)
+            elif next_key == 'where':
+                # Показать список адресов назначения для выбранного заказчика
+                cust_id = context.user_data.get('control_room_create_customer_id')
+                if cust_id:
+                    kb = self._build_addresses_markup(cust_id, direction='назн')
+                    if kb:
+                        await msg.reply_text('Выберите адрес назначения:', reply_markup=kb)
             return
 
         # Все поля собраны — вставляем запись в таблицу chart
@@ -1223,6 +1338,33 @@ class ControlRoom:
             nav.append(InlineKeyboardButton('▶️', callback_data=f'control:members:next:{page}'))
         kb.append(nav)
 
+        kb.append([InlineKeyboardButton('Отмена', callback_data='control:refresh')])
+        return InlineKeyboardMarkup(kb)
+
+    def _build_addresses_markup(self, customer_id: int, direction: str = 'отпр') -> Optional[InlineKeyboardMarkup]:
+        """Построить InlineKeyboard с адресами, привязанными к customer_id и заданным direction, отсортированными по rating desc.
+
+        direction: 'отпр' для отправления, 'назн' для назначения.
+        """
+        try:
+            with self.db.get_cursor() as cur:
+                cur.execute('''
+                    SELECT a.id, a.address FROM customer_addresse ca
+                    JOIN addresses a ON ca.addresse_id = a.id
+                    WHERE ca.customer_id = ? AND ca.direction = ?
+                    ORDER BY ca.rating DESC
+                ''', (customer_id, direction))
+                rows = cur.fetchall()
+        except Exception:
+            self.logger.exception('Ошибка при выборке адресов для заказчика')
+            return None
+        if not rows:
+            return None
+        kb = []
+        for r in rows:
+            aid, addr = r[0], r[1] or ''
+            label = addr if len(addr) <= 63 else addr[:60] + '...'
+            kb.append([InlineKeyboardButton(label, callback_data=f'control:address:{aid}')])
         kb.append([InlineKeyboardButton('Отмена', callback_data='control:refresh')])
         return InlineKeyboardMarkup(kb)
 
