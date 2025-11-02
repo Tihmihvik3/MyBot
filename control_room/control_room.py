@@ -656,6 +656,35 @@ class ControlRoom:
             except Exception:
                 self.logger.exception('Ошибка при показе списка членов')
             return
+        # Показать все адреса из таблицы addresses как Inline-кнопки
+        if action == 'addresses' and len(parts) >= 3 and parts[2] == 'showall':
+            # опционально принимаем направление в parts[3]
+            direction = parts[3] if len(parts) >= 4 else 'отпр'
+            try:
+                with self.db.get_cursor() as cur:
+                    cur.execute('SELECT id, address FROM addresses ORDER BY address COLLATE NOCASE ASC')
+                    rows = cur.fetchall()
+            except Exception:
+                self.logger.exception('Ошибка при выборке всех адресов')
+                await query.answer('Ошибка доступа к базе адресов')
+                return
+            if not rows:
+                try:
+                    await query.edit_message_text('Список адресов пуст.')
+                except Exception:
+                    await query.message.reply_text('Список адресов пуст.')
+                return
+            kb = []
+            for r in rows:
+                aid, addr = r[0], r[1] or ''
+                label = addr if len(addr) <= 63 else addr[:60] + '...'
+                kb.append([InlineKeyboardButton(label, callback_data=f'control:address:{aid}')])
+            kb.append([InlineKeyboardButton('Отмена', callback_data='control:refresh')])
+            try:
+                await query.edit_message_text('Все адреса:', reply_markup=InlineKeyboardMarkup(kb))
+            except Exception:
+                await query.message.reply_text('Все адреса:', reply_markup=InlineKeyboardMarkup(kb))
+            return
         # Обработка навигации списка членов: control:members:prev:<cur_page> и control:members:next:<cur_page>
         if action == 'members' and len(parts) >= 4:
             direction = parts[2]
@@ -814,12 +843,69 @@ class ControlRoom:
                 except Exception:
                     self.logger.exception('Ошибка при обработке рейтинга адреса')
 
-                await query.message.reply_text(f'Выбран адрес: {address_text}')
+                # Показываем краткое уведомление вместо постоянного сообщения
+                try:
+                    await query.answer(f'Выбран адрес: {address_text}', show_alert=False)
+                except Exception:
+                    # fallback: если query.answer недоступен — отправим сообщение
+                    await query.message.reply_text(f'Выбран адрес: {address_text}')
                 await self._advance_create_with_value(update, context, address_text)
                 # Свернём режим показа членов/адресов после выбора
                 context.user_data.pop('control_room_showing_members', None)
                 context.user_data.pop('control_room_members_message', None)
                 return
+        if action == 'phone' and len(parts) >= 3:
+            try:
+                member_id = int(parts[2])
+            except Exception:
+                await query.answer('Некорректный выбор')
+                return
+            # Получим телефон из таблицы members
+            try:
+                with self.db.get_cursor() as cur:
+                    cur.execute('SELECT phone FROM members WHERE id = ?', (member_id,))
+                    pr = cur.fetchone()
+            except Exception:
+                self.logger.exception('Ошибка при чтении телефона из members')
+                await query.answer('Ошибка доступа к базе')
+                return
+            phone_text = pr[0] if pr and pr[0] else None
+            if not phone_text:
+                await query.answer('Телефон не найден', show_alert=True)
+                return
+            # Если в процессе создания — вставим значение и продвинем шаг
+            if context.user_data.get('control_room_create_in_progress'):
+                # Используем answerCallbackQuery, чтобы не оставлять лишнее сообщение в чате
+                try:
+                    await query.answer(f'Выбран телефон: {phone_text}', show_alert=False)
+                except Exception:
+                    await query.message.reply_text(f'Выбран телефон: {phone_text}')
+                await self._advance_create_with_value(update, context, phone_text)
+                return
+            # Если ожидаем новое значение при редактировании и редактируем поле phone
+            if context.user_data.get('control_room_awaiting_new_value') and context.user_data.get('control_room_edit_field') == 'phone':
+                sel = context.user_data.get('control_room_selected_index')
+                ids = context.user_data.get('control_room_rows_ids', [])
+                if not ids or sel is None or sel < 1 or sel > len(ids):
+                    await query.message.reply_text('Ошибка состояния. Попробуйте снова.')
+                    return
+                row_id = ids[sel - 1]
+                try:
+                    with self.db.get_cursor() as cur:
+                        cur.execute('UPDATE chart SET phone = ? WHERE id = ?', (phone_text, row_id))
+                    await query.message.reply_text('Значение обновлено.')
+                except Exception as e:
+                    await query.message.reply_text(f'Ошибка при обновлении: {e}')
+                for k in ('control_room_awaiting_new_value','control_room_edit_field','control_room_selected_index'):
+                    context.user_data.pop(k, None)
+                await self.start(update, context)
+                return
+            # Иначе просто подтвердим телефон
+            try:
+                await query.answer(f'Телефон: {phone_text}')
+            except Exception:
+                pass
+            return
         if action == 'refresh':
             # Повторно показать список
             try:
@@ -925,17 +1011,86 @@ class ControlRoom:
                         pass
                 kb = self._build_quickdate_markup()
                 await query.edit_message_text(f'Текущее значение для "{label}": {disp}\nВыберите новую дату:', reply_markup=kb)
-            else:
+            elif field_key == 'customer':
                 # Если редактируем поле заказчика — покажем список членов (members) как Inline-кнопки
-                if field_key == 'customer':
-                    # Предложим показать весь список по кнопке, чтобы не перегружать интерфейс
+                # Предложим показать весь список по кнопке, чтобы не перегружать интерфейс
+                kb_small = InlineKeyboardMarkup([
+                    [InlineKeyboardButton('Показать весь список', callback_data='control:members:show')],
+                    [InlineKeyboardButton('Отмена', callback_data='control:refresh')]
+                ])
+                await query.edit_message_text(f'Текущее значение для "{label}": {current_val}\nНажмите, чтобы увидеть список заказчиков:', reply_markup=kb_small)
+            elif field_key in ('where', 'where_from'):
+                # При редактировании адреса предложим кнопку "Показать все" (и Отмена).
+                # Попробуем определить id заказчика, чтобы затем привязать адрес при выборе
+                cust_id = context.user_data.get('control_room_create_customer_id')
+                # Если не задан — попробуем получить из текущей записи chart
+                if not cust_id:
+                    try:
+                        with self.db.get_cursor() as cur:
+                            cur.execute('SELECT customer FROM chart WHERE id = ?', (row_id,))
+                            crow = cur.fetchone()
+                            cust_name = crow[0] if crow and crow[0] else None
+                            if cust_name:
+                                cur.execute("SELECT id FROM members WHERE TRIM(surname || ' ' || name || ' ' || COALESCE(patronymic, '')) = ?", (cust_name,))
+                                mr = cur.fetchone()
+                                if mr:
+                                    cust_id = mr[0]
+                                    # временно сохраним в context, чтобы обработчик выбора адреса смог использовать id
+                                    context.user_data['control_room_create_customer_id'] = cust_id
+                    except Exception:
+                        self.logger.exception('Ошибка при попытке найти id заказчика для редактирования адреса')
+                # Определим направление
+                direction = 'назн' if field_key == 'where' else 'отпр'
+                kb_small = InlineKeyboardMarkup([
+                    [InlineKeyboardButton('Показать все', callback_data=f'control:addresses:showall:{direction}')],
+                    [InlineKeyboardButton('Отмена', callback_data='control:refresh')]
+                ])
+                await query.edit_message_text(f'Текущее значение для "{label}": {current_val}\nНажмите кнопку, чтобы выбрать адрес из списка, или введите вручную:', reply_markup=kb_small)
+            elif field_key == 'phone':
+                # Если редактируем поле телефона — попробуем показать кнопку с телефоном
+                # Попробуем определить связанного заказчика: сначала посмотрим, есть ли customer_id в context
+                cust_id = context.user_data.get('control_room_create_customer_id')
+                phone_val = None
+                member_cb_id = None
+                cust_name = None
+                if cust_id:
+                    try:
+                        with self.db.get_cursor() as cur:
+                            cur.execute('SELECT phone FROM members WHERE id = ?', (cust_id,))
+                            pr = cur.fetchone()
+                            phone_val = pr[0] if pr and pr[0] else None
+                            member_cb_id = cust_id
+                    except Exception:
+                        self.logger.exception('Ошибка при чтении телефона заказчика')
+                        phone_val = None
+                else:
+                    # Если customer_id отсутствует — попробуем найти заказчика по имени в записи chart
+                    try:
+                        with self.db.get_cursor() as cur:
+                            cur.execute('SELECT customer FROM chart WHERE id = ?', (row_id,))
+                            crow = cur.fetchone()
+                            cust_name = crow[0] if crow and crow[0] else None
+                            if cust_name:
+                                # Пытаемся найти точное совпадение полного ФИО в members
+                                cur.execute("SELECT id, phone FROM members WHERE TRIM(surname || ' ' || name || ' ' || COALESCE(patronymic, '')) = ?", (cust_name,))
+                                mr = cur.fetchone()
+                                if mr and mr[1]:
+                                    member_cb_id = mr[0]
+                                    phone_val = mr[1]
+                    except Exception:
+                        self.logger.exception('Ошибка при поиске телефона по имени заказчика')
+                if phone_val:
+                    cb_id = member_cb_id if member_cb_id else ''
                     kb_small = InlineKeyboardMarkup([
-                        [InlineKeyboardButton('Показать весь список', callback_data='control:members:show')],
+                        [InlineKeyboardButton(phone_val, callback_data=f'control:phone:{cb_id}')],
                         [InlineKeyboardButton('Отмена', callback_data='control:refresh')]
                     ])
-                    await query.edit_message_text(f'Текущее значение для "{label}": {current_val}\nНажмите, чтобы увидеть список заказчиков:', reply_markup=kb_small)
+                    await query.edit_message_text(f'Текущее значение для "{label}": {current_val}\nНажмите номер, чтобы подставить телефон из карточки заказчика, или введите вручную:', reply_markup=kb_small)
                 else:
                     await query.edit_message_text(f'Текущее значение для "{label}": {current_val}\nОтправьте новое значение в чат.')
+            else:
+                # Для остальных полей просто просим ввести новое значение
+                await query.edit_message_text(f'Текущее значение для "{label}": {current_val}\nОтправьте новое значение в чат.')
             return
 
     # --- Создание новой заявки (пошаговый ввод) ---
@@ -1055,16 +1210,49 @@ class ControlRoom:
                 # Показать список адресов, привязанных к выбранному заказчику (если есть)
                 cust_id = context.user_data.get('control_room_create_customer_id')
                 if cust_id:
-                    kb = self._build_addresses_markup(cust_id)
+                    kb = self._build_addresses_markup(cust_id, include_show_all=True)
                     if kb:
                         await update.message.reply_text('Выберите адрес отправления:', reply_markup=kb)
+                else:
+                    # Если заказчик не выбран — всё равно предложим кнопку "Показать все" и "Отмена"
+                    kb = InlineKeyboardMarkup([
+                        [InlineKeyboardButton('Показать все', callback_data=f'control:addresses:showall:отпр')],
+                        [InlineKeyboardButton('Отмена', callback_data='control:refresh')]
+                    ])
+                    await update.message.reply_text('Выберите адрес отправления или введите вручную:', reply_markup=kb)
             elif next_key == 'where':
                 # Показать список адресов назначения для выбранного заказчика
                 cust_id = context.user_data.get('control_room_create_customer_id')
                 if cust_id:
-                    kb = self._build_addresses_markup(cust_id, direction='назн')
+                    kb = self._build_addresses_markup(cust_id, direction='назн', include_show_all=True)
                     if kb:
                         await update.message.reply_text('Выберите адрес назначения:', reply_markup=kb)
+                    else:
+                        # Нет привязанных адресов, но предложим показать все
+                        kb_fallback = InlineKeyboardMarkup([
+                            [InlineKeyboardButton('Показать все', callback_data=f'control:addresses:showall:назн')],
+                            [InlineKeyboardButton('Отмена', callback_data='control:refresh')]
+                        ])
+                        await update.message.reply_text('Выберите адрес назначения или введите вручную:', reply_markup=kb_fallback)
+            elif next_key == 'phone':
+                # Показать кнопку с телефоном выбранного заказчика (используем id заказчика)
+                cust_id = context.user_data.get('control_room_create_customer_id')
+                phone_val = None
+                if cust_id:
+                    try:
+                        with self.db.get_cursor() as cur:
+                            cur.execute('SELECT phone FROM members WHERE id = ?', (cust_id,))
+                            pr = cur.fetchone()
+                            phone_val = pr[0] if pr and pr[0] else None
+                    except Exception:
+                        self.logger.exception('Ошибка при чтении телефона заказчика (create flow)')
+                        phone_val = None
+                if phone_val:
+                    kb = InlineKeyboardMarkup([
+                        [InlineKeyboardButton(phone_val, callback_data=f'control:phone:{cust_id}')],
+                        [InlineKeyboardButton('Отмена', callback_data='control:refresh')]
+                    ])
+                    await update.message.reply_text('Нажмите номер для автоматической подстановки телефона в заявку, или введите вручную:', reply_markup=kb)
             return
 
         # Все поля собраны — вставляем запись в таблицу chart
@@ -1144,16 +1332,47 @@ class ControlRoom:
             elif next_key == 'where_from':
                 cust_id = context.user_data.get('control_room_create_customer_id')
                 if cust_id:
-                    kb = self._build_addresses_markup(cust_id)
+                    kb = self._build_addresses_markup(cust_id, include_show_all=True)
                     if kb:
                         await msg.reply_text('Выберите адрес отправления:', reply_markup=kb)
+                else:
+                    kb = InlineKeyboardMarkup([
+                        [InlineKeyboardButton('Показать все', callback_data=f'control:addresses:showall:отпр')],
+                        [InlineKeyboardButton('Отмена', callback_data='control:refresh')]
+                    ])
+                    await msg.reply_text('Выберите адрес отправления или введите вручную:', reply_markup=kb)
             elif next_key == 'where':
                 # Показать список адресов назначения для выбранного заказчика
                 cust_id = context.user_data.get('control_room_create_customer_id')
                 if cust_id:
-                    kb = self._build_addresses_markup(cust_id, direction='назн')
+                    kb = self._build_addresses_markup(cust_id, direction='назн', include_show_all=True)
                     if kb:
                         await msg.reply_text('Выберите адрес назначения:', reply_markup=kb)
+                    else:
+                        kb_fallback = InlineKeyboardMarkup([
+                            [InlineKeyboardButton('Показать все', callback_data=f'control:addresses:showall:назн')],
+                            [InlineKeyboardButton('Отмена', callback_data='control:refresh')]
+                        ])
+                        await msg.reply_text('Выберите адрес назначения или введите вручную:', reply_markup=kb_fallback)
+            elif next_key == 'phone':
+                # Показать кнопку с телефоном выбранного заказчика (используем id заказчика)
+                cust_id = context.user_data.get('control_room_create_customer_id')
+                phone_val = None
+                if cust_id:
+                    try:
+                        with self.db.get_cursor() as cur:
+                            cur.execute('SELECT phone FROM members WHERE id = ?', (cust_id,))
+                            pr = cur.fetchone()
+                            phone_val = pr[0] if pr and pr[0] else None
+                    except Exception:
+                        self.logger.exception('Ошибка при чтении телефона заказчика (create flow callback)')
+                        phone_val = None
+                if phone_val:
+                    kb = InlineKeyboardMarkup([
+                        [InlineKeyboardButton(phone_val, callback_data=f'control:phone:{cust_id}')],
+                        [InlineKeyboardButton('Отмена', callback_data='control:refresh')]
+                    ])
+                    await msg.reply_text('Нажмите номер для автоматической подстановки телефона в заявку, или введите вручную:', reply_markup=kb)
             return
 
         # Все поля собраны — вставляем запись в таблицу chart
@@ -1341,7 +1560,7 @@ class ControlRoom:
         kb.append([InlineKeyboardButton('Отмена', callback_data='control:refresh')])
         return InlineKeyboardMarkup(kb)
 
-    def _build_addresses_markup(self, customer_id: int, direction: str = 'отпр') -> Optional[InlineKeyboardMarkup]:
+    def _build_addresses_markup(self, customer_id: int, direction: str = 'отпр', include_show_all: bool = False) -> Optional[InlineKeyboardMarkup]:
         """Построить InlineKeyboard с адресами, привязанными к customer_id и заданным direction, отсортированными по rating desc.
 
         direction: 'отпр' для отправления, 'назн' для назначения.
@@ -1365,6 +1584,10 @@ class ControlRoom:
             aid, addr = r[0], r[1] or ''
             label = addr if len(addr) <= 63 else addr[:60] + '...'
             kb.append([InlineKeyboardButton(label, callback_data=f'control:address:{aid}')])
+        # Добавим кнопку Показать все (по желанию) и кнопку Отмена
+        if include_show_all:
+            # Параметр direction передаём, чтобы показать, какие адреса нужны при выборе
+            kb.append([InlineKeyboardButton('Показать все', callback_data=f'control:addresses:showall:{direction}')])
         kb.append([InlineKeyboardButton('Отмена', callback_data='control:refresh')])
         return InlineKeyboardMarkup(kb)
 

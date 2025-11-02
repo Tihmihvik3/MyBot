@@ -8,3 +8,4 @@ settings.py
 .venv/
 .DS_Store
 __pycache__/
+*.docx
