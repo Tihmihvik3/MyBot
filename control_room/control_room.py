@@ -635,7 +635,9 @@ class ControlRoom:
                 # ожидаем, что он может ввести номер страницы в чат
                 if context is not None:
                     context.user_data['control_room_showing_members'] = True
-                kb = self._build_members_markup(context=context)
+                    # при показе полного списка предыдущим представлением считается компактное меню членов
+                    context.user_data['control_room_prev_view'] = 'members_small'
+                    kb = self._build_members_markup(context=context)
                 if kb:
                     try:
                         await query.edit_message_text('Список членов:', reply_markup=kb)
@@ -656,6 +658,76 @@ class ControlRoom:
                         await query.message.reply_text('Список членов пуст.')
             except Exception:
                 self.logger.exception('Ошибка при показе списка членов')
+            return
+        # Показать часто набираемых членов: control:members:frequent
+        if action == 'members' and len(parts) >= 3 and parts[2] == 'frequent':
+            try:
+                # отмечаем, что показан список членов
+                if context is not None:
+                    context.user_data['control_room_showing_members'] = True
+                    # при показе часто набираемых предыдущим представлением считается компактное меню членов
+                    context.user_data['control_room_prev_view'] = 'members_small'
+                with self.db.get_cursor() as cur:
+                    cur.execute('''
+                        SELECT m.id, m.surname, m.name, m.patronymic
+                        FROM customers_rating cr
+                        JOIN members m ON cr.customer_id = m.id
+                        ORDER BY cr.rating DESC
+                        LIMIT 50
+                    ''')
+                    rows = cur.fetchall()
+            except Exception:
+                self.logger.exception('Ошибка при выборке часто набираемых членов')
+                await query.answer('Ошибка доступа к базе членов')
+                return
+            if not rows:
+                try:
+                    await query.edit_message_text('Список часто набираемых пуст.')
+                except Exception:
+                    await query.message.reply_text('Список часто набираемых пуст.')
+                return
+            kb = []
+            for r in rows:
+                mid = r[0]
+                surname = r[1] or ''
+                name = r[2] or ''
+                patron = r[3] or ''
+                label = f"{surname} {name} {patron}".strip()
+                if len(label) > 63:
+                    label = label[:60] + '...'
+                kb.append([InlineKeyboardButton(label, callback_data=f'control:member:{mid}')])
+            kb.append([InlineKeyboardButton('Назад', callback_data='control:back'), InlineKeyboardButton('Отмена', callback_data='control:refresh')])
+            try:
+                await query.edit_message_text('Часто набираемые:', reply_markup=InlineKeyboardMarkup(kb))
+                if context is not None and getattr(query, 'message', None):
+                    context.user_data['control_room_members_message'] = (query.message.chat.id, query.message.message_id)
+            except Exception:
+                await query.message.reply_text('Часто набираемые:', reply_markup=InlineKeyboardMarkup(kb))
+            return
+
+        # Обработка кнопки "Назад" -> возвращаемся к предыдущему представлению (если известно)
+        if action == 'back':
+            prev = context.user_data.get('control_room_prev_view')
+            try:
+                if prev == 'members_small':
+                    # Показать компактное меню выбора заказчика
+                    kb_small = InlineKeyboardMarkup([
+                        [InlineKeyboardButton('Показать весь список', callback_data='control:members:show'), InlineKeyboardButton('Часто набираемые', callback_data='control:members:frequent')],
+                        [InlineKeyboardButton('Назад', callback_data='control:back'), InlineKeyboardButton('Отмена', callback_data='control:refresh')]
+                    ])
+                    try:
+                        await query.edit_message_text('Нажмите, чтобы увидеть список заказчиков:', reply_markup=kb_small)
+                    except Exception:
+                        await query.message.reply_text('Нажмите, чтобы увидеть список заказчиков:', reply_markup=kb_small)
+                    return
+            except Exception:
+                self.logger.exception('Ошибка при обработке кнопки Назад')
+            # fallback: показать основной список
+            try:
+                await query.answer()
+            except Exception:
+                pass
+            await self.start(update, context)
             return
         # Показать все адреса из таблицы addresses как Inline-кнопки
         if action == 'addresses' and len(parts) >= 3 and parts[2] == 'showall':
@@ -681,7 +753,7 @@ class ControlRoom:
                 label = addr if len(addr) <= 63 else addr[:60] + '...'
                 # Включаем direction в callback, чтобы при выборе из полного списка направление было явно задано
                 kb.append([InlineKeyboardButton(label, callback_data=f'control:address:{aid}:{direction}')])
-            kb.append([InlineKeyboardButton('Отмена', callback_data='control:refresh')])
+            kb.append([InlineKeyboardButton('Назад', callback_data='control:back'), InlineKeyboardButton('Отмена', callback_data='control:refresh')])
             try:
                 await query.edit_message_text('Все адреса:', reply_markup=InlineKeyboardMarkup(kb))
             except Exception:
@@ -767,6 +839,17 @@ class ControlRoom:
             if context.user_data.get('control_room_create_in_progress'):
                 # Сохраним id выбранного заказчика для последующих привязок адресов
                 context.user_data['control_room_create_customer_id'] = member_id
+                # Обновить/вставить рейтинг в customers_rating
+                try:
+                    with self.db.get_cursor() as cur:
+                        cur.execute('SELECT rating FROM customers_rating WHERE customer_id = ?', (member_id,))
+                        rr = cur.fetchone()
+                        if rr:
+                            cur.execute('UPDATE customers_rating SET rating = rating + 1 WHERE customer_id = ?', (member_id,))
+                        else:
+                            cur.execute('INSERT INTO customers_rating (customer_id, rating) VALUES (?, ?)', (member_id, 1))
+                except Exception:
+                    self.logger.exception('Ошибка при обновлении customers_rating')
                 await query.message.reply_text(f'Выбран заказчик: {full_name}')
                 await self._advance_create_with_value(update, context, full_name)
                 # Свернём режим показа членов после выбора
@@ -786,6 +869,17 @@ class ControlRoom:
                     await query.message.reply_text('Значение обновлено.')
                 except Exception as e:
                     await query.message.reply_text(f'Ошибка при обновлении: {e}')
+                # Обновить/вставить рейтинг в customers_rating при редактировании поля customer
+                try:
+                    with self.db.get_cursor() as cur:
+                        cur.execute('SELECT rating FROM customers_rating WHERE customer_id = ?', (member_id,))
+                        rr = cur.fetchone()
+                        if rr:
+                            cur.execute('UPDATE customers_rating SET rating = rating + 1 WHERE customer_id = ?', (member_id,))
+                        else:
+                            cur.execute('INSERT INTO customers_rating (customer_id, rating) VALUES (?, ?)', (member_id, 1))
+                except Exception:
+                    self.logger.exception('Ошибка при обновлении customers_rating (edit)')
                 for k in ('control_room_awaiting_new_value','control_room_edit_field','control_room_selected_index'):
                     context.user_data.pop(k, None)
                 # Свернём режим показа членов после выбора
@@ -970,7 +1064,7 @@ class ControlRoom:
                 key = f[0]
                 label = self.FIELD_LABELS.get(key, key)
                 kb.append([InlineKeyboardButton(f"{i}. {label}", callback_data=f'control:field:{idx}:{i}')])
-            kb.append([InlineKeyboardButton('Отмена', callback_data='control:refresh')])
+            kb.append([InlineKeyboardButton('Назад', callback_data='control:back'), InlineKeyboardButton('Отмена', callback_data='control:refresh')])
             await query.edit_message_text('Выберите поле для редактирования:', reply_markup=InlineKeyboardMarkup(kb))
             return
         if action == 'field' and len(parts) >= 4:
@@ -1022,8 +1116,11 @@ class ControlRoom:
                 # Если редактируем поле заказчика — покажем список членов (members) как Inline-кнопки
                 # Предложим показать весь список по кнопке, чтобы не перегружать интерфейс
                 kb_small = InlineKeyboardMarkup([
-                    [InlineKeyboardButton('Показать весь список', callback_data='control:members:show')],
-                    [InlineKeyboardButton('Отмена', callback_data='control:refresh')]
+                    [
+                        InlineKeyboardButton('Показать весь список', callback_data='control:members:show'),
+                        InlineKeyboardButton('Часто набираемые', callback_data='control:members:frequent')
+                    ],
+                    [InlineKeyboardButton('Назад', callback_data='control:back'), InlineKeyboardButton('Отмена', callback_data='control:refresh')]
                 ])
                 await query.edit_message_text(f'Текущее значение для "{label}": {current_val}\nНажмите, чтобы увидеть список заказчиков:', reply_markup=kb_small)
             elif field_key in ('where', 'where_from'):
@@ -1050,7 +1147,7 @@ class ControlRoom:
                 direction = 'назн' if field_key == 'where' else 'отпр'
                 kb_small = InlineKeyboardMarkup([
                     [InlineKeyboardButton('Показать все', callback_data=f'control:addresses:showall:{direction}')],
-                    [InlineKeyboardButton('Отмена', callback_data='control:refresh')]
+                    [InlineKeyboardButton('Назад', callback_data='control:back'), InlineKeyboardButton('Отмена', callback_data='control:refresh')]
                 ])
                 await query.edit_message_text(f'Текущее значение для "{label}": {current_val}\nНажмите кнопку, чтобы выбрать адрес из списка, или введите вручную:', reply_markup=kb_small)
             elif field_key == 'phone':
@@ -1090,7 +1187,7 @@ class ControlRoom:
                     cb_id = member_cb_id if member_cb_id else ''
                     kb_small = InlineKeyboardMarkup([
                         [InlineKeyboardButton(phone_val, callback_data=f'control:phone:{cb_id}')],
-                        [InlineKeyboardButton('Отмена', callback_data='control:refresh')]
+                        [InlineKeyboardButton('Назад', callback_data='control:back'), InlineKeyboardButton('Отмена', callback_data='control:refresh')]
                     ])
                     await query.edit_message_text(f'Текущее значение для "{label}": {current_val}\nНажмите номер, чтобы подставить телефон из карточки заказчика, или введите вручную:', reply_markup=kb_small)
                 else:
@@ -1136,10 +1233,13 @@ class ControlRoom:
             kb = self._build_quickdate_markup()
             await msg.reply_text('Выберите дату:', reply_markup=kb)
         elif first_key == 'customer':
-            # Сначала показываем кнопку «Показать весь список», чтобы не загромождать интерфейс
+            # Сначала показываем кнопку «Показать весь список» и «Часто набираемые», чтобы не загромождать интерфейс
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton('Показать весь список', callback_data='control:members:show')],
-                [InlineKeyboardButton('Отмена', callback_data='control:refresh')]
+                [
+                    InlineKeyboardButton('Показать весь список', callback_data='control:members:show'),
+                    InlineKeyboardButton('Часто набираемые', callback_data='control:members:frequent')
+                ],
+                [InlineKeyboardButton('Назад', callback_data='control:back'), InlineKeyboardButton('Отмена', callback_data='control:refresh')]
             ])
             await msg.reply_text('Нажмите, чтобы увидеть список заказчиков:', reply_markup=kb)
         # Если следующий ключ будет адрес отправления — предложим список адресов для выбранного заказчика (если есть)
@@ -1207,10 +1307,13 @@ class ControlRoom:
                 kb = self._build_quickdate_markup()
                 await update.message.reply_text('Выберите дату:', reply_markup=kb)
             elif next_key == 'customer':
-                # Покажем кнопку «Показать весь список» вместо вывода полного списка сразу
+                # Покажем кнопки «Показать весь список» и «Часто набираемые» вместо вывода полного списка сразу
                 kb = InlineKeyboardMarkup([
-                    [InlineKeyboardButton('Показать весь список', callback_data='control:members:show')],
-                    [InlineKeyboardButton('Отмена', callback_data='control:refresh')]
+                    [
+                        InlineKeyboardButton('Показать весь список', callback_data='control:members:show'),
+                        InlineKeyboardButton('Часто набираемые', callback_data='control:members:frequent')
+                    ],
+                    [InlineKeyboardButton('Назад', callback_data='control:back'), InlineKeyboardButton('Отмена', callback_data='control:refresh')]
                 ])
                 await update.message.reply_text('Нажмите, чтобы увидеть список заказчиков:', reply_markup=kb)
             elif next_key == 'where_from':
@@ -1224,7 +1327,7 @@ class ControlRoom:
                     # Если заказчик не выбран — всё равно предложим кнопку "Показать все" и "Отмена"
                     kb = InlineKeyboardMarkup([
                         [InlineKeyboardButton('Показать все', callback_data=f'control:addresses:showall:отпр')],
-                        [InlineKeyboardButton('Отмена', callback_data='control:refresh')]
+                        [InlineKeyboardButton('Назад', callback_data='control:back'), InlineKeyboardButton('Отмена', callback_data='control:refresh')]
                     ])
                     await update.message.reply_text('Выберите адрес отправления или введите вручную:', reply_markup=kb)
             elif next_key == 'where':
@@ -1238,7 +1341,7 @@ class ControlRoom:
                         # Нет привязанных адресов, но предложим показать все
                         kb_fallback = InlineKeyboardMarkup([
                             [InlineKeyboardButton('Показать все', callback_data=f'control:addresses:showall:назн')],
-                            [InlineKeyboardButton('Отмена', callback_data='control:refresh')]
+                            [InlineKeyboardButton('Назад', callback_data='control:back'), InlineKeyboardButton('Отмена', callback_data='control:refresh')]
                         ])
                         await update.message.reply_text('Выберите адрес назначения или введите вручную:', reply_markup=kb_fallback)
             elif next_key == 'phone':
@@ -1257,7 +1360,7 @@ class ControlRoom:
                 if phone_val:
                     kb = InlineKeyboardMarkup([
                         [InlineKeyboardButton(phone_val, callback_data=f'control:phone:{cust_id}')],
-                        [InlineKeyboardButton('Отмена', callback_data='control:refresh')]
+                        [InlineKeyboardButton('Назад', callback_data='control:back'), InlineKeyboardButton('Отмена', callback_data='control:refresh')]
                     ])
                     await update.message.reply_text('Нажмите номер для автоматической подстановки телефона в заявку, или введите вручную:', reply_markup=kb)
             return
@@ -1340,8 +1443,11 @@ class ControlRoom:
                 await msg.reply_text('Выберите дату:', reply_markup=kb)
             elif next_key == 'customer':
                 kb = InlineKeyboardMarkup([
-                    [InlineKeyboardButton('Показать весь список', callback_data='control:members:show')],
-                    [InlineKeyboardButton('Отмена', callback_data='control:refresh')]
+                    [
+                        InlineKeyboardButton('Показать весь список', callback_data='control:members:show'),
+                        InlineKeyboardButton('Часто набираемые', callback_data='control:members:frequent')
+                    ],
+                    [InlineKeyboardButton('Назад', callback_data='control:back'), InlineKeyboardButton('Отмена', callback_data='control:refresh')]
                 ])
                 await msg.reply_text('Нажмите, чтобы увидеть список заказчиков:', reply_markup=kb)
             elif next_key == 'where_from':
@@ -1353,7 +1459,7 @@ class ControlRoom:
                 else:
                     kb = InlineKeyboardMarkup([
                         [InlineKeyboardButton('Показать все', callback_data=f'control:addresses:showall:отпр')],
-                        [InlineKeyboardButton('Отмена', callback_data='control:refresh')]
+                        [InlineKeyboardButton('Назад', callback_data='control:back'), InlineKeyboardButton('Отмена', callback_data='control:refresh')]
                     ])
                     await msg.reply_text('Выберите адрес отправления или введите вручную:', reply_markup=kb)
             elif next_key == 'where':
@@ -1366,7 +1472,7 @@ class ControlRoom:
                     else:
                         kb_fallback = InlineKeyboardMarkup([
                             [InlineKeyboardButton('Показать все', callback_data=f'control:addresses:showall:назн')],
-                            [InlineKeyboardButton('Отмена', callback_data='control:refresh')]
+                            [InlineKeyboardButton('Назад', callback_data='control:back'), InlineKeyboardButton('Отмена', callback_data='control:refresh')]
                         ])
                         await msg.reply_text('Выберите адрес назначения или введите вручную:', reply_markup=kb_fallback)
             elif next_key == 'phone':
@@ -1385,7 +1491,7 @@ class ControlRoom:
                 if phone_val:
                     kb = InlineKeyboardMarkup([
                         [InlineKeyboardButton(phone_val, callback_data=f'control:phone:{cust_id}')],
-                        [InlineKeyboardButton('Отмена', callback_data='control:refresh')]
+                        [InlineKeyboardButton('Назад', callback_data='control:back'), InlineKeyboardButton('Отмена', callback_data='control:refresh')]
                     ])
                     await msg.reply_text('Нажмите номер для автоматической подстановки телефона в заявку, или введите вручную:', reply_markup=kb)
             return
@@ -1432,7 +1538,7 @@ class ControlRoom:
         buttons = [
             [InlineKeyboardButton('Сегодня', callback_data='control:quickdate:today'), InlineKeyboardButton('Завтра', callback_data='control:quickdate:tomorrow')],
             [InlineKeyboardButton('Через 2 дня', callback_data='control:quickdate:plus2'), InlineKeyboardButton('Ввести вручную', callback_data='control:quickdate:manual')],
-            [InlineKeyboardButton('Отмена', callback_data='control:refresh')]
+            [InlineKeyboardButton('Назад', callback_data='control:back'), InlineKeyboardButton('Отмена', callback_data='control:refresh')]
         ]
         return InlineKeyboardMarkup(buttons)
 
@@ -1598,7 +1704,7 @@ class ControlRoom:
             nav.append(InlineKeyboardButton('▶️', callback_data=f'control:members:next:{page}'))
         kb.append(nav)
 
-        kb.append([InlineKeyboardButton('Отмена', callback_data='control:refresh')])
+        kb.append([InlineKeyboardButton('Назад', callback_data='control:back'), InlineKeyboardButton('Отмена', callback_data='control:refresh')])
         return InlineKeyboardMarkup(kb)
 
     def _build_addresses_markup(self, customer_id: int, direction: str = 'отпр', include_show_all: bool = False) -> Optional[InlineKeyboardMarkup]:
@@ -1626,9 +1732,9 @@ class ControlRoom:
             label = addr if len(addr) <= 63 else addr[:60] + '...'
             # Включаем направление в callback, чтобы обработчик получил однозначно нужное направление
             kb.append([InlineKeyboardButton(label, callback_data=f'control:address:{aid}:{direction}')])
-        # Добавим кнопку Показать все (всегда показываем) и кнопку Отмена
+        # Добавим кнопку Показать все (всегда показываем) и кнопки Назад/Отмена
         kb.append([InlineKeyboardButton('Показать все', callback_data=f'control:addresses:showall:{direction}')])
-        kb.append([InlineKeyboardButton('Отмена', callback_data='control:refresh')])
+        kb.append([InlineKeyboardButton('Назад', callback_data='control:back'), InlineKeyboardButton('Отмена', callback_data='control:refresh')])
         return InlineKeyboardMarkup(kb)
 
     def _parse_date_text(self, text: str) -> Optional[date]:

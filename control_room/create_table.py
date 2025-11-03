@@ -44,6 +44,25 @@ async def ensure_chart_table(db: Database, update, context, logger: logging.Logg
                         logger.info('Создана таблица customer_addresse')
                 except Exception:
                     logger.exception('Ошибка при создании таблицы customer_addresse')
+                # Создание таблицы customers_rating (customer_id, rating)
+                try:
+                    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='customers_rating'")
+                    if not cur.fetchone():
+                        cur.execute('''
+                        CREATE TABLE customers_rating (
+                            customer_id INTEGER,
+                            rating INTEGER,
+                            FOREIGN KEY(customer_id) REFERENCES members(id)
+                        )
+                        ''')
+                        logger.info('Создана таблица customers_rating')
+                        try:
+                            # Создаём уникальный индекс по customer_id, чтобы обеспечить одну запись на заказчика
+                            cur.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_customers_rating_customer_unique ON customers_rating(customer_id)')
+                        except Exception:
+                            logger.exception('Не удалось создать уникальный индекс для customers_rating')
+                except Exception:
+                    logger.exception('Ошибка при создании таблицы customers_rating')
 
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='chart'")
             found = cursor.fetchone()
