@@ -1,6 +1,17 @@
 from db.database import Database
 from verification_id import VerificationID
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+def escape_html(text: str) -> str:
+    """Простая эскейп-функция для HTML-опасных символов (заменяет &<>"').
+
+    Используется вместо внешней зависимости, чтобы безопасно формировать HTML-сообщения.
+    """
+    if text is None:
+        return ''
+    s = str(text)
+    return s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;').replace("'", '&#39;')
+
 from datetime import date, timedelta
 import asyncio
 import re
@@ -15,6 +26,103 @@ class ControlRoom:
     def __init__(self):
         self.db = Database()
         self.logger = logging.getLogger(__name__)
+        # Текст приветствия, который нельзя удалять
+        self._greeting_text = 'Добро пожаловать! Я бот Анжеро-Судженской МО ВОС. Чем могу помочь?'
+
+    async def _purge_control_room_messages(self, update, context) -> None:
+        """Удалить все ранее сохранённые ботом сообщения в этом модуле, кроме приветствия.
+
+        Хранится в context.user_data['control_room_sent_messages'] как список словарей
+        {'chat_id': ..., 'message_id': ..., 'text': ...}.
+        """
+        try:
+            bot = getattr(context, 'bot', None)
+            if bot is None:
+                return
+            # Соберём записи из user_data и chat_data (чтобы приветствие, отправленное в start_command, учитывалось)
+            stored_user = context.user_data.get('control_room_sent_messages', []) or []
+            stored_chat = getattr(context, 'chat_data', {}).get('control_room_sent_messages', []) or []
+            combined = []
+            seen = set()
+            for e in (stored_user + stored_chat):
+                cid = e.get('chat_id')
+                mid = e.get('message_id')
+                key = (cid, mid)
+                if key in seen:
+                    continue
+                seen.add(key)
+                combined.append(e)
+
+            keep = []
+            for e in combined:
+                try:
+                    if e.get('text') == self._greeting_text:
+                        keep.append(e)
+                        continue
+                    await bot.delete_message(chat_id=e.get('chat_id'), message_id=e.get('message_id'))
+                except Exception:
+                    # не критично, просто логируем и не включаем в keep
+                    try:
+                        self.logger.debug(f"Не удалось удалить сообщение {e}")
+                    except Exception:
+                        pass
+            # Сохраняем только те, которые нужно оставить (например, приветствие)
+            try:
+                context.user_data['control_room_sent_messages'] = keep
+            except Exception:
+                pass
+            try:
+                if hasattr(context, 'chat_data'):
+                    context.chat_data['control_room_sent_messages'] = keep
+            except Exception:
+                pass
+        except Exception:
+            try:
+                self.logger.exception('Ошибка при очистке старых сообщений control_room')
+            except Exception:
+                pass
+
+    async def _record_sent_message(self, context, sent, text: str) -> None:
+        """Сохранить отправленное сообщение в context.user_data для последующей очистки."""
+        try:
+            if not getattr(sent, 'chat', None):
+                return
+            entry = {'chat_id': sent.chat.id, 'message_id': sent.message_id, 'text': text}
+            lst = context.user_data.get('control_room_sent_messages', [])
+            lst.append(entry)
+            context.user_data['control_room_sent_messages'] = lst
+        except Exception:
+            try:
+                self.logger.exception('Ошибка при сохранении отправленного сообщения')
+            except Exception:
+                pass
+
+    async def _send_and_track(self, context, msg_obj, text: str, reply_markup=None):
+        """Удаляет старые сообщения, отправляет новое и сохраняет его для последующей очистки."""
+        try:
+            # Очистим предыдущие сообщения (best-effort)
+            await self._purge_control_room_messages(None, context)
+        except Exception:
+            pass
+        try:
+            sent = await msg_obj.reply_text(text, reply_markup=reply_markup)
+            try:
+                await self._record_sent_message(context, sent, text)
+            except Exception:
+                pass
+            return sent
+        except Exception:
+            # fallback: если отправка не удалась — пробуем без markup
+            try:
+                sent = await msg_obj.reply_text(text)
+                try:
+                    await self._record_sent_message(context, sent, text)
+                except Exception:
+                    pass
+                return sent
+            except Exception:
+                self.logger.exception('Не удалось отправить и сохранить сообщение')
+                return None
 
     async def start(self, update, context) -> None:
         # Проверяем роль пользователя, аналогично admin_message
@@ -26,6 +134,12 @@ class ControlRoom:
             return
 
         # Убедимся, что есть подключение к БД
+        # Перед показом новой информации удаляем старые сообщения, кроме приветствия
+        try:
+            await self._purge_control_room_messages(update, context)
+        except Exception:
+            self.logger.exception('Ошибка при предварительной очистке сообщений')
+
         try:
             # Вынесенная логика проверки/создания таблицы и миграций
             self.logger.debug('ControlRoom.start: вызов ensure_chart_table')
@@ -480,7 +594,7 @@ class ControlRoom:
             if not row:
                 await query.edit_message_text('Запись не найдена.')
                 return
-            # Сформируем текст с дружественными названиями
+            # Сформируем текст с дружественными названиями (экранируем HTML)
             keys = ['date','where_from','departure_time','where','arrival_time','customer','phone']
             text_lines = []
             for k, val in zip(keys, row[1:]):
@@ -493,16 +607,18 @@ class ControlRoom:
                         dt = datetime.strptime(display_val, '%Y-%m-%d')
                         display_val = dt.strftime('%d.%m.%Y')
                     except Exception:
-                        # если парсинг не прошёл — оставим оригинал
                         pass
-                text_lines.append(f"{label}: {display_val}")
-            text = '\n'.join(text_lines)
+                # Экранируем для HTML
+                esc_label = escape_html(str(label))
+                esc_val = escape_html(str(display_val))
+                text_lines.append(f"{esc_label}: {esc_val}")
+            text = '<b>Карточка заявки:</b>\n' + '\n'.join(text_lines)
             # Inline buttons: Edit, Delete, Back
             kb = [
                 [InlineKeyboardButton('Редактировать', callback_data=f'control:edit:{idx}') , InlineKeyboardButton('Удалить', callback_data=f'control:delete:{idx}')],
-                [InlineKeyboardButton('Назад', callback_data='control:refresh')]
+                [InlineKeyboardButton('◀️ Назад', callback_data='control:refresh')]
             ]
-            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
             return
         if action == 'create':
             # Запустить текстовый поток создания
@@ -696,7 +812,7 @@ class ControlRoom:
                 if len(label) > 63:
                     label = label[:60] + '...'
                 kb.append([InlineKeyboardButton(label, callback_data=f'control:member:{mid}')])
-            kb.append([InlineKeyboardButton('Назад', callback_data='control:back'), InlineKeyboardButton('Отмена', callback_data='control:refresh')])
+            kb.append([InlineKeyboardButton('◀️ Назад', callback_data='control:back'), InlineKeyboardButton('❌ Отмена', callback_data='control:refresh')])
             try:
                 await query.edit_message_text('Часто набираемые:', reply_markup=InlineKeyboardMarkup(kb))
                 if context is not None and getattr(query, 'message', None):
@@ -712,8 +828,8 @@ class ControlRoom:
                 if prev == 'members_small':
                     # Показать компактное меню выбора заказчика
                     kb_small = InlineKeyboardMarkup([
-                        [InlineKeyboardButton('Показать весь список', callback_data='control:members:show'), InlineKeyboardButton('Часто набираемые', callback_data='control:members:frequent')],
-                        [InlineKeyboardButton('Назад', callback_data='control:back'), InlineKeyboardButton('Отмена', callback_data='control:refresh')]
+                        [InlineKeyboardButton('📋 Показать весь список', callback_data='control:members:show'), InlineKeyboardButton('🔝 Часто набираемые', callback_data='control:members:frequent')],
+                        [InlineKeyboardButton('◀️ Назад', callback_data='control:back'), InlineKeyboardButton('❌ Отмена', callback_data='control:refresh')]
                     ])
                     try:
                         await query.edit_message_text('Нажмите, чтобы увидеть список заказчиков:', reply_markup=kb_small)
@@ -753,7 +869,7 @@ class ControlRoom:
                 label = addr if len(addr) <= 63 else addr[:60] + '...'
                 # Включаем direction в callback, чтобы при выборе из полного списка направление было явно задано
                 kb.append([InlineKeyboardButton(label, callback_data=f'control:address:{aid}:{direction}')])
-            kb.append([InlineKeyboardButton('Назад', callback_data='control:back'), InlineKeyboardButton('Отмена', callback_data='control:refresh')])
+            kb.append([InlineKeyboardButton('◀️ Назад', callback_data='control:back'), InlineKeyboardButton('❌ Отмена', callback_data='control:refresh')])
             try:
                 await query.edit_message_text('Все адреса:', reply_markup=InlineKeyboardMarkup(kb))
             except Exception:
@@ -955,6 +1071,68 @@ class ControlRoom:
                 context.user_data.pop('control_room_showing_members', None)
                 context.user_data.pop('control_room_members_message', None)
                 return
+
+            # Если ожидаем новое значение при редактировании и редактируем поле адреса (откуда/куда)
+            if context.user_data.get('control_room_awaiting_new_value') and context.user_data.get('control_room_edit_field') in ('where_from', 'where'):
+                sel = context.user_data.get('control_room_selected_index')
+                ids = context.user_data.get('control_room_rows_ids', [])
+                if not ids or sel is None or sel < 1 or sel > len(ids):
+                    try:
+                        await query.message.reply_text('Ошибка состояния. Попробуйте снова.')
+                    except Exception:
+                        pass
+                    return
+                row_id = ids[sel - 1]
+                # Определим имя колонки для обновления
+                col_name = 'where_from' if context.user_data.get('control_room_edit_field') == 'where_from' else 'where'
+                # Обновим запись в chart и сделаем upsert в customer_addresse (direction = 'отпр' для where_from, 'назн' для where)
+                try:
+                    with self.db.get_cursor() as cur:
+                        # Обновляем поле в chart
+                        cur.execute(f'UPDATE chart SET {col_name} = ? WHERE id = ?', (address_text, row_id))
+                        # Попробуем определить id заказчика, указанный в этой записи
+                        cur.execute('SELECT customer FROM chart WHERE id = ?', (row_id,))
+                        crow = cur.fetchone()
+                        cust_name = crow[0] if crow and crow[0] else None
+                        cust_id = None
+                        if cust_name:
+                            try:
+                                cur.execute("SELECT id FROM members WHERE TRIM(surname || ' ' || name || ' ' || COALESCE(patronymic, '')) = ?", (cust_name.strip(),))
+                                mr = cur.fetchone()
+                                if mr:
+                                    cust_id = mr[0]
+                            except Exception:
+                                # Не критично, продолжим без cust_id
+                                pass
+                        direction = 'отпр' if col_name == 'where_from' else 'назн'
+                        if cust_id:
+                            # upsert в customer_addresse
+                            cur.execute('SELECT rating FROM customer_addresse WHERE customer_id = ? AND addresse_id = ? AND direction = ?', (cust_id, addr_id, direction))
+                            ex = cur.fetchone()
+                            if ex:
+                                cur.execute('UPDATE customer_addresse SET rating = rating + 1 WHERE customer_id = ? AND addresse_id = ? AND direction = ?', (cust_id, addr_id, direction))
+                            else:
+                                cur.execute('INSERT INTO customer_addresse (customer_id, addresse_id, direction, rating) VALUES (?, ?, ?, ?)', (cust_id, addr_id, direction, 1))
+                except Exception:
+                    self.logger.exception('Ошибка при обновлении адреса (edit)')
+                    try:
+                        await query.message.reply_text('Ошибка при обновлении адреса.')
+                    except Exception:
+                        pass
+                    # очистим флаги и обновим список, даже при ошибке
+                    for k in ('control_room_awaiting_new_value','control_room_edit_field','control_room_selected_index'):
+                        context.user_data.pop(k, None)
+                    await self.start(update, context)
+                    return
+                # Успешно обновлено
+                try:
+                    await query.message.reply_text('Значение обновлено.')
+                except Exception:
+                    pass
+                for k in ('control_room_awaiting_new_value','control_room_edit_field','control_room_selected_index'):
+                    context.user_data.pop(k, None)
+                await self.start(update, context)
+                return
         if action == 'phone' and len(parts) >= 3:
             try:
                 member_id = int(parts[2])
@@ -1028,7 +1206,7 @@ class ControlRoom:
                 await query.edit_message_text('Некорректный номер для удаления.')
                 return
             # Попросим подтверждение
-            kb = [[InlineKeyboardButton('Да', callback_data=f'control:delete_confirm:{idx}'), InlineKeyboardButton('Нет', callback_data='control:refresh')]]
+            kb = [[InlineKeyboardButton('✅ Да', callback_data=f'control:delete_confirm:{idx}'), InlineKeyboardButton('❌ Нет', callback_data='control:refresh')]]
             await query.edit_message_text('Подтвердите удаление записи.', reply_markup=InlineKeyboardMarkup(kb))
             return
         if action == 'delete_confirm' and len(parts) >= 3:
@@ -1064,7 +1242,7 @@ class ControlRoom:
                 key = f[0]
                 label = self.FIELD_LABELS.get(key, key)
                 kb.append([InlineKeyboardButton(f"{i}. {label}", callback_data=f'control:field:{idx}:{i}')])
-            kb.append([InlineKeyboardButton('Назад', callback_data='control:back'), InlineKeyboardButton('Отмена', callback_data='control:refresh')])
+            kb.append([InlineKeyboardButton('◀️ Назад', callback_data='control:back'), InlineKeyboardButton('❌ Отмена', callback_data='control:refresh')])
             await query.edit_message_text('Выберите поле для редактирования:', reply_markup=InlineKeyboardMarkup(kb))
             return
         if action == 'field' and len(parts) >= 4:
@@ -1117,10 +1295,10 @@ class ControlRoom:
                 # Предложим показать весь список по кнопке, чтобы не перегружать интерфейс
                 kb_small = InlineKeyboardMarkup([
                     [
-                        InlineKeyboardButton('Показать весь список', callback_data='control:members:show'),
-                        InlineKeyboardButton('Часто набираемые', callback_data='control:members:frequent')
+                        InlineKeyboardButton('📋 Показать весь список', callback_data='control:members:show'),
+                        InlineKeyboardButton('🔝 Часто набираемые', callback_data='control:members:frequent')
                     ],
-                    [InlineKeyboardButton('Назад', callback_data='control:back'), InlineKeyboardButton('Отмена', callback_data='control:refresh')]
+                    [InlineKeyboardButton('◀️ Назад', callback_data='control:back'), InlineKeyboardButton('❌ Отмена', callback_data='control:refresh')]
                 ])
                 await query.edit_message_text(f'Текущее значение для "{label}": {current_val}\nНажмите, чтобы увидеть список заказчиков:', reply_markup=kb_small)
             elif field_key in ('where', 'where_from'):
@@ -1146,8 +1324,8 @@ class ControlRoom:
                 # Определим направление
                 direction = 'назн' if field_key == 'where' else 'отпр'
                 kb_small = InlineKeyboardMarkup([
-                    [InlineKeyboardButton('Показать все', callback_data=f'control:addresses:showall:{direction}')],
-                    [InlineKeyboardButton('Назад', callback_data='control:back'), InlineKeyboardButton('Отмена', callback_data='control:refresh')]
+                    [InlineKeyboardButton('📍 Показать все', callback_data=f'control:addresses:showall:{direction}')],
+                    [InlineKeyboardButton('◀️ Назад', callback_data='control:back'), InlineKeyboardButton('❌ Отмена', callback_data='control:refresh')]
                 ])
                 await query.edit_message_text(f'Текущее значение для "{label}": {current_val}\nНажмите кнопку, чтобы выбрать адрес из списка, или введите вручную:', reply_markup=kb_small)
             elif field_key == 'phone':
@@ -1187,7 +1365,7 @@ class ControlRoom:
                     cb_id = member_cb_id if member_cb_id else ''
                     kb_small = InlineKeyboardMarkup([
                         [InlineKeyboardButton(phone_val, callback_data=f'control:phone:{cb_id}')],
-                        [InlineKeyboardButton('Назад', callback_data='control:back'), InlineKeyboardButton('Отмена', callback_data='control:refresh')]
+                        [InlineKeyboardButton('◀️ Назад', callback_data='control:back'), InlineKeyboardButton('❌ Отмена', callback_data='control:refresh')]
                     ])
                     await query.edit_message_text(f'Текущее значение для "{label}": {current_val}\nНажмите номер, чтобы подставить телефон из карточки заказчика, или введите вручную:', reply_markup=kb_small)
                 else:
@@ -1226,24 +1404,23 @@ class ControlRoom:
         # Задаём первое приглашение
         # Используем message из callback_query, если создаём через InlineKeyboard
         msg = update.callback_query.message if getattr(update, 'callback_query', None) else update.message
-        # Первый запрос — теперь это заказчик; если это поле customer, покажем список членов
-        await msg.reply_text(self.fields[0][1])
+        # Первый запрос — теперь это заказчик; если это поле customer, покажем компактное меню
         first_key = self.fields[0][0]
+        prompt = self.fields[0][1]
         if first_key == 'date':
             kb = self._build_quickdate_markup()
-            await msg.reply_text('Выберите дату:', reply_markup=kb)
+            await self._send_and_track(context, msg, prompt, reply_markup=kb)
         elif first_key == 'customer':
-            # Сначала показываем кнопку «Показать весь список» и «Часто набираемые», чтобы не загромождать интерфейс
             kb = InlineKeyboardMarkup([
                 [
-                    InlineKeyboardButton('Показать весь список', callback_data='control:members:show'),
-                    InlineKeyboardButton('Часто набираемые', callback_data='control:members:frequent')
+                    InlineKeyboardButton('📋 Показать весь список', callback_data='control:members:show'),
+                    InlineKeyboardButton('🔝 Часто набираемые', callback_data='control:members:frequent')
                 ],
-                [InlineKeyboardButton('Назад', callback_data='control:back'), InlineKeyboardButton('Отмена', callback_data='control:refresh')]
+                [InlineKeyboardButton('◀️ Назад', callback_data='control:back'), InlineKeyboardButton('❌ Отмена', callback_data='control:refresh')]
             ])
-            await msg.reply_text('Нажмите, чтобы увидеть список заказчиков:', reply_markup=kb)
-        # Если следующий ключ будет адрес отправления — предложим список адресов для выбранного заказчика (если есть)
-        # (Сделаем это только после выбора заказчика; при старте тут нет customer yet)
+            await self._send_and_track(context, msg, prompt, reply_markup=kb)
+        else:
+            await self._send_and_track(context, msg, prompt)
 
     async def handle_create_step(self, update, context) -> None:
         step = context.user_data.get('control_room_create_step', 0)
@@ -1310,10 +1487,10 @@ class ControlRoom:
                 # Покажем кнопки «Показать весь список» и «Часто набираемые» вместо вывода полного списка сразу
                 kb = InlineKeyboardMarkup([
                     [
-                        InlineKeyboardButton('Показать весь список', callback_data='control:members:show'),
-                        InlineKeyboardButton('Часто набираемые', callback_data='control:members:frequent')
+                        InlineKeyboardButton('📋 Показать весь список', callback_data='control:members:show'),
+                        InlineKeyboardButton('🔝 Часто набираемые', callback_data='control:members:frequent')
                     ],
-                    [InlineKeyboardButton('Назад', callback_data='control:back'), InlineKeyboardButton('Отмена', callback_data='control:refresh')]
+                    [InlineKeyboardButton('◀️ Назад', callback_data='control:back'), InlineKeyboardButton('❌ Отмена', callback_data='control:refresh')]
                 ])
                 await update.message.reply_text('Нажмите, чтобы увидеть список заказчиков:', reply_markup=kb)
             elif next_key == 'where_from':
@@ -1326,8 +1503,8 @@ class ControlRoom:
                 else:
                     # Если заказчик не выбран — всё равно предложим кнопку "Показать все" и "Отмена"
                     kb = InlineKeyboardMarkup([
-                        [InlineKeyboardButton('Показать все', callback_data=f'control:addresses:showall:отпр')],
-                        [InlineKeyboardButton('Назад', callback_data='control:back'), InlineKeyboardButton('Отмена', callback_data='control:refresh')]
+                        [InlineKeyboardButton('📍 Показать все', callback_data=f'control:addresses:showall:отпр')],
+                        [InlineKeyboardButton('◀️ Назад', callback_data='control:back'), InlineKeyboardButton('❌ Отмена', callback_data='control:refresh')]
                     ])
                     await update.message.reply_text('Выберите адрес отправления или введите вручную:', reply_markup=kb)
             elif next_key == 'where':
@@ -1340,8 +1517,8 @@ class ControlRoom:
                     else:
                         # Нет привязанных адресов, но предложим показать все
                         kb_fallback = InlineKeyboardMarkup([
-                            [InlineKeyboardButton('Показать все', callback_data=f'control:addresses:showall:назн')],
-                            [InlineKeyboardButton('Назад', callback_data='control:back'), InlineKeyboardButton('Отмена', callback_data='control:refresh')]
+                            [InlineKeyboardButton('📍 Показать все', callback_data=f'control:addresses:showall:назн')],
+                            [InlineKeyboardButton('◀️ Назад', callback_data='control:back'), InlineKeyboardButton('❌ Отмена', callback_data='control:refresh')]
                         ])
                         await update.message.reply_text('Выберите адрес назначения или введите вручную:', reply_markup=kb_fallback)
             elif next_key == 'phone':
@@ -1360,7 +1537,7 @@ class ControlRoom:
                 if phone_val:
                     kb = InlineKeyboardMarkup([
                         [InlineKeyboardButton(phone_val, callback_data=f'control:phone:{cust_id}')],
-                        [InlineKeyboardButton('Назад', callback_data='control:back'), InlineKeyboardButton('Отмена', callback_data='control:refresh')]
+                        [InlineKeyboardButton('◀️ Назад', callback_data='control:back'), InlineKeyboardButton('❌ Отмена', callback_data='control:refresh')]
                     ])
                     await update.message.reply_text('Нажмите номер для автоматической подстановки телефона в заявку, или введите вручную:', reply_markup=kb)
             return
@@ -1444,10 +1621,10 @@ class ControlRoom:
             elif next_key == 'customer':
                 kb = InlineKeyboardMarkup([
                     [
-                        InlineKeyboardButton('Показать весь список', callback_data='control:members:show'),
-                        InlineKeyboardButton('Часто набираемые', callback_data='control:members:frequent')
+                        InlineKeyboardButton('📋 Показать весь список', callback_data='control:members:show'),
+                        InlineKeyboardButton('🔝 Часто набираемые', callback_data='control:members:frequent')
                     ],
-                    [InlineKeyboardButton('Назад', callback_data='control:back'), InlineKeyboardButton('Отмена', callback_data='control:refresh')]
+                    [InlineKeyboardButton('◀️ Назад', callback_data='control:back'), InlineKeyboardButton('❌ Отмена', callback_data='control:refresh')]
                 ])
                 await msg.reply_text('Нажмите, чтобы увидеть список заказчиков:', reply_markup=kb)
             elif next_key == 'where_from':
@@ -1458,8 +1635,8 @@ class ControlRoom:
                         await msg.reply_text('Выберите адрес отправления:', reply_markup=kb)
                 else:
                     kb = InlineKeyboardMarkup([
-                        [InlineKeyboardButton('Показать все', callback_data=f'control:addresses:showall:отпр')],
-                        [InlineKeyboardButton('Назад', callback_data='control:back'), InlineKeyboardButton('Отмена', callback_data='control:refresh')]
+                        [InlineKeyboardButton('📍 Показать все', callback_data=f'control:addresses:showall:отпр')],
+                        [InlineKeyboardButton('◀️ Назад', callback_data='control:back'), InlineKeyboardButton('❌ Отмена', callback_data='control:refresh')]
                     ])
                     await msg.reply_text('Выберите адрес отправления или введите вручную:', reply_markup=kb)
             elif next_key == 'where':
@@ -1471,8 +1648,8 @@ class ControlRoom:
                         await msg.reply_text('Выберите адрес назначения:', reply_markup=kb)
                     else:
                         kb_fallback = InlineKeyboardMarkup([
-                            [InlineKeyboardButton('Показать все', callback_data=f'control:addresses:showall:назн')],
-                            [InlineKeyboardButton('Назад', callback_data='control:back'), InlineKeyboardButton('Отмена', callback_data='control:refresh')]
+                            [InlineKeyboardButton('📍 Показать все', callback_data=f'control:addresses:showall:назн')],
+                            [InlineKeyboardButton('◀️ Назад', callback_data='control:back'), InlineKeyboardButton('❌ Отмена', callback_data='control:refresh')]
                         ])
                         await msg.reply_text('Выберите адрес назначения или введите вручную:', reply_markup=kb_fallback)
             elif next_key == 'phone':
@@ -1491,7 +1668,7 @@ class ControlRoom:
                 if phone_val:
                     kb = InlineKeyboardMarkup([
                         [InlineKeyboardButton(phone_val, callback_data=f'control:phone:{cust_id}')],
-                        [InlineKeyboardButton('Назад', callback_data='control:back'), InlineKeyboardButton('Отмена', callback_data='control:refresh')]
+                        [InlineKeyboardButton('◀️ Назад', callback_data='control:back'), InlineKeyboardButton('❌ Отмена', callback_data='control:refresh')]
                     ])
                     await msg.reply_text('Нажмите номер для автоматической подстановки телефона в заявку, или введите вручную:', reply_markup=kb)
             return
@@ -1538,7 +1715,7 @@ class ControlRoom:
         buttons = [
             [InlineKeyboardButton('Сегодня', callback_data='control:quickdate:today'), InlineKeyboardButton('Завтра', callback_data='control:quickdate:tomorrow')],
             [InlineKeyboardButton('Через 2 дня', callback_data='control:quickdate:plus2'), InlineKeyboardButton('Ввести вручную', callback_data='control:quickdate:manual')],
-            [InlineKeyboardButton('Назад', callback_data='control:back'), InlineKeyboardButton('Отмена', callback_data='control:refresh')]
+            [InlineKeyboardButton('◀️ Назад', callback_data='control:back'), InlineKeyboardButton('❌ Отмена', callback_data='control:refresh')]
         ]
         return InlineKeyboardMarkup(buttons)
 
@@ -1704,7 +1881,7 @@ class ControlRoom:
             nav.append(InlineKeyboardButton('▶️', callback_data=f'control:members:next:{page}'))
         kb.append(nav)
 
-        kb.append([InlineKeyboardButton('Назад', callback_data='control:back'), InlineKeyboardButton('Отмена', callback_data='control:refresh')])
+        kb.append([InlineKeyboardButton('◀️ Назад', callback_data='control:back'), InlineKeyboardButton('❌ Отмена', callback_data='control:refresh')])
         return InlineKeyboardMarkup(kb)
 
     def _build_addresses_markup(self, customer_id: int, direction: str = 'отпр', include_show_all: bool = False) -> Optional[InlineKeyboardMarkup]:
@@ -1733,8 +1910,8 @@ class ControlRoom:
             # Включаем направление в callback, чтобы обработчик получил однозначно нужное направление
             kb.append([InlineKeyboardButton(label, callback_data=f'control:address:{aid}:{direction}')])
         # Добавим кнопку Показать все (всегда показываем) и кнопки Назад/Отмена
-        kb.append([InlineKeyboardButton('Показать все', callback_data=f'control:addresses:showall:{direction}')])
-        kb.append([InlineKeyboardButton('Назад', callback_data='control:back'), InlineKeyboardButton('Отмена', callback_data='control:refresh')])
+        kb.append([InlineKeyboardButton('📍 Показать все', callback_data=f'control:addresses:showall:{direction}')])
+        kb.append([InlineKeyboardButton('◀️ Назад', callback_data='control:back'), InlineKeyboardButton('❌ Отмена', callback_data='control:refresh')])
         return InlineKeyboardMarkup(kb)
 
     def _parse_date_text(self, text: str) -> Optional[date]:
