@@ -1,6 +1,8 @@
 import logging
 from db.database import Database
 from telegram import InlineKeyboardMarkup, InlineKeyboardButton
+import traceback
+from admin_notify import notify_admin
 
 
 logger = logging.getLogger(__name__)
@@ -220,6 +222,10 @@ class SortAndFiltr:
             return
         except Exception as e:
             logger.exception('Ошибка при пагинации сортировки')
+            try:
+                await notify_admin(context, 'Ошибка при пагинации сортировки (sort_and_filtr)', traceback.format_exc())
+            except Exception:
+                pass
             await update.message.reply_text(f'Ошибка при сортировке: {e}')
 
     async def handle_filter_value(self, update, context):

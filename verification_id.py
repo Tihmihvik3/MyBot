@@ -30,6 +30,12 @@ class VerificationID:
                 await msg.reply_text(f'Ошибка при проверке роли: {e}')
             except Exception:
                 pass
+            try:
+                import traceback
+                from admin_notify import notify_admin
+                await notify_admin(context, 'Ошибка при чтении роли из members (verification_id)', traceback.format_exc())
+            except Exception:
+                pass
             return None
         logger.debug(f'VerificationID.check_role: found role={USER_ROLE}')
         return USER_ROLE

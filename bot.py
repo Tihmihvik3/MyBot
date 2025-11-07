@@ -1,8 +1,21 @@
-from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
+import asyncio
 from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, filters
 import settings
 import logging
 from db.models import User
+
+
+async def _delete_message_later(bot, chat_id: int, message_id: int, delay_seconds: int = 10):
+    """Удалить сообщение через delay_seconds (тихий, безопасный фоновой таск)."""
+    try:
+        await asyncio.sleep(delay_seconds)
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except Exception:
+            logging.debug('Не удалось удалить временное сообщение (возможно уже удалено)')
+    except Exception:
+        logging.exception('Ошибка в фоне при плановом удалении сообщения')
 
 
 async def get_user_id_message(update, context):
@@ -15,11 +28,25 @@ async def start_command(update, context):
     # Ответ на команду /start с кнопками
     # Клавиатура (используется, когда нужно показать пользователю), но по умолчанию скрыта
     keyboard = [["Новости", "Фото"], ["Видео", "Контакты"], ["Справка", "ДП"]]
-    # Не показываем клавиатуру по умолчанию — скрываем кнопки
-    await update.message.reply_text(
-        "Добро пожаловать! Я бот Анжеро-Судженской МО ВОС. Чем могу помочь?",
-        reply_markup=ReplyKeyboardRemove()
-    )
+    # Inline-клавиатура приветствия: сначала кнопка "Меню бота", затем "Справка"
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton('Меню бота', callback_data='menu:show'), InlineKeyboardButton('Справка', callback_data='help:show')]])
+    # Используем message из Update (если есть)
+    msg_obj = update.message if getattr(update, 'message', None) else (update.callback_query.message if getattr(update, 'callback_query', None) else None)
+    greeting_text = "Добро пожаловать! Я бот Анжеро-Судженской МО ВОС. Чем могу помочь?"
+    if msg_obj is not None:
+        await msg_obj.reply_text(greeting_text, reply_markup=kb)
+    else:
+        # fallback: отправка через bot.send_message, если можно определить чат
+        chat_id = update.effective_chat.id if getattr(update, 'effective_chat', None) else None
+        if chat_id:
+            sent = await context.bot.send_message(chat_id=chat_id, text=greeting_text, reply_markup=kb)
+            # Сохраним отправленное приветствие в chat_data, чтобы другие модули (control_room) могли его сохранить/соблюдать
+            try:
+                lst = context.chat_data.get('control_room_sent_messages', [])
+                lst.append({'chat_id': sent.chat.id, 'message_id': sent.message_id, 'text': greeting_text})
+                context.chat_data['control_room_sent_messages'] = lst
+            except Exception:
+                logging.exception('Не удалось сохранить приветствие в chat_data')
 
 async def greet_user(update, context):
     # Ответ на приветствие
@@ -28,6 +55,123 @@ async def greet_user(update, context):
 async def help_message(update, context):
     # Ответ на сообщение "справка"
     await update.message.reply_text("Справка: Этот бот может отвечать на команды и сообщения, такие как 'привет' и 'справка'.")
+
+
+async def help_callback(update, context):
+    # Обработчик для inline-кнопки Справка / Закрыть справку
+    query = update.callback_query
+    data = getattr(query, 'data', '')
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    origin = query.message
+    # Текст справки
+    help_text = "Справка: Этот бот может отвечать на команды и сообщения, такие как 'привет' и 'справка'."
+
+    # Если уже есть ранее отправленная справка — удалим её перед отправкой новой
+    prev = context.user_data.get('control_help_message')
+    if prev and data == 'help:show':
+        try:
+            await context.bot.delete_message(chat_id=prev[0], message_id=prev[1])
+        except Exception:
+            pass
+        context.user_data.pop('control_help_message', None)
+
+    if data == 'help:show':
+        # Отправляем сообщение со справкой и кнопку "Закрыть справку"
+        try:
+            kb_help = InlineKeyboardMarkup([[InlineKeyboardButton('Закрыть справку', callback_data='help:close')]])
+            sent = await origin.reply_text(help_text, reply_markup=kb_help)
+            # Сохраним sent message id для последующего удаления
+            if getattr(sent, 'chat', None):
+                context.user_data['control_help_message'] = (sent.chat.id, sent.message_id)
+        except Exception:
+            logging.exception('Не удалось отправить справку по callback')
+        # Изменим клавиатуру на исходном сообщении — заменим кнопку на "Закрыть справку"
+        try:
+            kb_toggle = InlineKeyboardMarkup([[InlineKeyboardButton('Закрыть справку', callback_data='help:close')]])
+            await origin.edit_reply_markup(reply_markup=kb_toggle)
+        except Exception:
+            # редактирование может быть недоступно — игнорируем
+            logging.debug('Не удалось изменить клавиатуру исходного сообщения (help:show)')
+        return
+
+
+async def menu_callback(update, context):
+    # Обработчик для inline-кнопки Меню бота / Закрыть меню
+    query = update.callback_query
+    data = getattr(query, 'data', '')
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    origin = query.message
+    # Основная клавиатура (ReplyKeyboard)
+    keyboard = [["Новости", "Фото"], ["Видео", "Контакты"], ["Справка", "ДП"]]
+    if data == 'menu:show':
+        try:
+            reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+            sent = await origin.reply_text('Главное меню:', reply_markup=reply_markup)
+            # Сохраним sent message id, чтобы при закрытии можно было удалить/очистить
+            if getattr(sent, 'chat', None):
+                context.user_data['control_menu_message'] = (sent.chat.id, sent.message_id)
+        except Exception:
+            logging.exception('Не удалось отправить главное меню по callback')
+        # Изменим клавиатуру на исходном сообщении — заменим кнопку на "Закрыть меню"
+        try:
+            kb_toggle = InlineKeyboardMarkup([[InlineKeyboardButton('Закрыть меню', callback_data='menu:close'), InlineKeyboardButton('Справка', callback_data='help:show')]])
+            await origin.edit_reply_markup(reply_markup=kb_toggle)
+        except Exception:
+            logging.debug('Не удалось изменить клавиатуру исходного сообщения (menu:show)')
+        return
+
+    if data == 'menu:close':
+        # Удалим ранее отправленное сообщение с меню, если оно было отправлено
+        stored = context.user_data.pop('control_menu_message', None)
+        if stored:
+            try:
+                await context.bot.delete_message(chat_id=stored[0], message_id=stored[1])
+            except Exception:
+                # В любом случае отправим ReplyKeyboardRemove, чтобы убрать клавиатуру
+                pass
+        # Отправим команду снять клавиатуру — сообщение временное, удалим через 10 секунд
+        try:
+            sent_close = await origin.reply_text('Меню закрыто', reply_markup=ReplyKeyboardRemove())
+            # Удалим уведомление через 10 секунд (fire-and-forget задача)
+            try:
+                bot = getattr(context, 'bot', None)
+                if bot and getattr(sent_close, 'chat', None):
+                    asyncio.create_task(_delete_message_later(bot, sent_close.chat.id, sent_close.message_id, 10))
+            except Exception:
+                logging.exception('Не удалось запланировать удаление сообщения "Меню закрыто"')
+        except Exception:
+            logging.debug('Не удалось отправить сообщение с удалением ReplyKeyboard')
+        # Восстановим inline-кнопку на исходном сообщении обратно на 'Меню бота'
+        try:
+            kb_restore = InlineKeyboardMarkup([[InlineKeyboardButton('Меню бота', callback_data='menu:show'), InlineKeyboardButton('Справка', callback_data='help:show')]])
+            await origin.edit_reply_markup(reply_markup=kb_restore)
+        except Exception:
+            logging.debug('Не удалось восстановить клавиатуру исходного сообщения (menu:close)')
+        return
+
+    if data == 'help:close':
+        # удалить ранее отправленную справку (если есть)
+        stored = context.user_data.pop('control_help_message', None)
+        if stored:
+            try:
+                await context.bot.delete_message(chat_id=stored[0], message_id=stored[1])
+            except Exception:
+                logging.debug('Не удалось удалить сообщение со справкой')
+        # Восстановим кнопку на исходном сообщении обратно на 'Справка'
+        try:
+            kb_restore = InlineKeyboardMarkup([[InlineKeyboardButton('Справка', callback_data='help:show')]])
+            await origin.edit_reply_markup(reply_markup=kb_restore)
+        except Exception:
+            logging.debug('Не удалось восстановить клавиатуру исходного сообщения (help:close)')
+        return
 
 
 async def show_menu_command(update, context):
@@ -172,6 +316,12 @@ def main():
     from control_room.control_room import ControlRoom
     control = ControlRoom()
     application.add_handler(CallbackQueryHandler(control.handle_callback, pattern=r'^control:'))
+    # CallbackQuery для inline-кнопки Справка (show/close)
+    application.add_handler(CallbackQueryHandler(help_callback, pattern=r'^help:'))
+    # CallbackQuery для inline-кнопки Меню бота (show/close)
+    application.add_handler(CallbackQueryHandler(menu_callback, pattern=r'^menu:'))
+    # Обработчик для сообщения '?' чтобы показать справку
+    application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'(?i)^\s*\?\s*$'), help_message))
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'(?i)новости'), news_message))
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'(?i)фото'), photo_message))
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'(?i)видео'), video_message))
