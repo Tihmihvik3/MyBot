@@ -55,6 +55,7 @@ from control_room.messages import (
     CHOOSE_FIELD_PROMPT,
 )
 from telegram.error import BadRequest
+from control_room import departure_time
 
 
 class ControlRoom:
@@ -424,7 +425,7 @@ class ControlRoom:
                 if page_num > total_pages:
                     await self._send_and_track(context, msg, PAGE_NOT_FOUND.format(total_pages=total_pages))
                     return True
-                # установить страницу и показать клавиатуру членов
+                # Nустановить страницу и показать клавиатуру членов
                 context.user_data['control_room_members_page'] = page_num - 1
                 kb = self._build_members_markup(context=context)
                 if kb:
@@ -919,6 +920,35 @@ class ControlRoom:
                 for k in ('control_room_awaiting_new_value','control_room_edit_field','control_room_selected_index'):
                     context.user_data.pop(k, None)
                 await self.start(update, context)
+                return
+        # Обработка выбора/показа селектора времени отправления
+        if action == 'departure_time' and len(parts) >= 3:
+            sub = parts[2]
+            try:
+                if sub == 'choose':
+                    # Показать интерфейс выбора времени (в модуле departure_time)
+                    try:
+                        await departure_time.show_picker(self, update, context)
+                    except Exception:
+                        self.logger.exception('Ошибка при показе селектора времени (departure_time.choose)')
+                        try:
+                            await notify_admin(context, 'Ошибка при показе селектора времени (control_room)', traceback.format_exc())
+                        except Exception:
+                            pass
+                    return
+                if sub == 'pick' and len(parts) >= 4:
+                    time_token = parts[3]
+                    try:
+                        await departure_time.handle_pick(self, update, context, time_token)
+                    except Exception:
+                        self.logger.exception('Ошибка при обработке выбора времени (departure_time.pick)')
+                        try:
+                            await notify_admin(context, 'Ошибка при обработке выбора времени (control_room)', traceback.format_exc())
+                        except Exception:
+                            pass
+                    return
+            except Exception:
+                self.logger.exception('Ошибка в обработчике departure_time')
                 return
         # Показать весь список членов по запросу: control:members:show
         if action == 'members' and len(parts) >= 3 and parts[2] == 'show':
@@ -1647,6 +1677,46 @@ class ControlRoom:
                 return
             value = parsed.isoformat()
 
+        # Если поле — время отправления, нормализуем ввод по правилам (модуль departure_time)
+        if key == 'departure_time':
+            try:
+                norm = departure_time.normalize_manual_time(value)
+            except Exception:
+                norm = ''
+            if not norm:
+                # Попросим ввести корректный формат и предложим выбор времени
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton('Выбрать время', callback_data='control:departure_time:choose')],
+                    [InlineKeyboardButton('◀️ Назад', callback_data='control:back'), InlineKeyboardButton('❌ Отмена', callback_data='control:refresh')]
+                ])
+                await self._send_and_track(context, update.message, 'Неверный формат времени. Введите в формате HH:MM или выберите время:', reply_markup=kb)
+                return
+            value = norm
+            # Покажем короткое подтверждение выбора времени (не трекаем, чтобы не удалялось при _purge сразу)
+            try:
+                confirm_text = departure_time.messages.DEPARTURE_TIME_CONFIRM.format(time=norm)
+            except Exception:
+                try:
+                    from control_room import messages as _m
+                    confirm_text = _m.DEPARTURE_TIME_CONFIRM.format(time=norm)
+                except Exception:
+                    confirm_text = f'Время отправления установлено: {norm}'
+            sent = None
+            try:
+                sent = await update.message.reply_text(confirm_text)
+            except Exception:
+                try:
+                    sent = await self._send_and_track(context, update.message, confirm_text)
+                except Exception:
+                    sent = None
+            if sent:
+                try:
+                    bot = getattr(context, 'bot', None)
+                    if bot and getattr(sent, 'chat', None):
+                        asyncio.create_task(self._delete_message_later(bot, sent.chat.id, sent.message_id, 5))
+                except Exception:
+                    pass
+
         # Если заполняется поле адреса вручную (откуда или куда) — сохранить адрес в таблице addresses
         if key in ('where_from', 'where'):
             direction = 'отпр' if key == 'where_from' else 'назн'
@@ -1685,6 +1755,13 @@ class ControlRoom:
                 kb = self._build_quickdate_markup()
                 await self._send_and_track(context, update.message, prompt, reply_markup=kb)
                 await self._send_and_track(context, update.message, SELECT_DATE, reply_markup=kb)
+            elif next_key == 'departure_time':
+                # Предложим кнопку выбора времени — реализация показа/обработки вынесена в control_room.departure_time
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton('Выбрать время', callback_data='control:departure_time:choose')],
+                    [InlineKeyboardButton('◀️ Назад', callback_data='control:back'), InlineKeyboardButton('❌ Отмена', callback_data='control:refresh')]
+                ])
+                await self._send_and_track(context, update.message, prompt, reply_markup=kb)
             elif next_key == 'arrival_time':
                 kb = InlineKeyboardMarkup([
                     [InlineKeyboardButton('Пропустить', callback_data='control:create_skip_arrival')],
@@ -1830,6 +1907,12 @@ class ControlRoom:
                 kb = self._build_quickdate_markup()
                 await self._send_and_track(context, msg, prompt, reply_markup=kb)
                 await self._send_and_track(context, msg, SELECT_DATE, reply_markup=kb)
+            elif next_key == 'departure_time':
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton('Выбрать время', callback_data='control:departure_time:choose')],
+                    [InlineKeyboardButton('◀️ Назад', callback_data='control:back'), InlineKeyboardButton('❌ Отмена', callback_data='control:refresh')]
+                ])
+                await self._send_and_track(context, msg, prompt, reply_markup=kb)
             elif next_key == 'arrival_time':
                 kb = InlineKeyboardMarkup([
                     [InlineKeyboardButton('Пропустить', callback_data='control:create_skip_arrival')],
@@ -2158,6 +2241,63 @@ class ControlRoom:
             return date.today()
         if text in ('завтра', 'tomorrow'):
             return date.today() + timedelta(days=1)
+        # Формат ДД (только день) — подставляем текущий месяц и год; если день уже в прошлом, используем следующий месяц
+        m = re.match(r'^(\d{1,2})$', text)
+        if m:
+            d = int(m.group(1))
+            try:
+                today = date.today()
+                year = today.year
+                month = today.month
+                # Попробуем текущий месяц
+                try:
+                    candidate = date(year, month, d)
+                except Exception:
+                    # Если в текущем месяце такой день невозможен — попробуем следующий месяц
+                    nm = month + 1
+                    ny = year
+                    if nm > 12:
+                        nm = 1
+                        ny += 1
+                    try:
+                        candidate = date(ny, nm, d)
+                    except Exception:
+                        return None
+                # Если полученная дата уже в прошлом — перейдём на следующий месяц
+                if candidate < today:
+                    nm = month + 1
+                    ny = year
+                    if nm > 12:
+                        nm = 1
+                        ny += 1
+                    try:
+                        candidate = date(ny, nm, d)
+                    except Exception:
+                        return None
+                return candidate
+            except Exception:
+                return None
+        # Формат ДДММ (без разделителя), например '0109' -> 01.09.current_year (или next year, если дата уже прошла)
+        m = re.match(r'^(\d{2})(\d{2})$', text)
+        if m:
+            d, mo = map(int, m.groups())
+            try:
+                today = date.today()
+                year = today.year
+                # Попытаемся создать дату в текущем году
+                try:
+                    candidate = date(year, mo, d)
+                except Exception:
+                    return None
+                # Если полученная дата в прошлом — предположим следующий год
+                if candidate < today:
+                    try:
+                        candidate = date(year + 1, mo, d)
+                    except Exception:
+                        return None
+                return candidate
+            except Exception:
+                return None
         # YYYY-MM-DD
         m = re.match(r'^(\d{4})-(\d{1,2})-(\d{1,2})$', text)
         if m:
