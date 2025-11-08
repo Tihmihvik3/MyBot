@@ -62,9 +62,31 @@ class DelRecord:
             db = Database()
             try:
                 with db.get_cursor() as cursor:
-                    cursor.execute('DELETE FROM members WHERE rowid = ?', (rowid,))
-                await update.message.reply_text('Запись успешно удалена! Повторить удаление? 1. Да 2. Выход')
-                context.user_data['delrecord_repeat_or_exit'] = True
+                    # Сначала получим все поля записи
+                    cursor.execute('SELECT rowid, ' + ', '.join(self.db_fields) + ' FROM members WHERE rowid = ?', (rowid,))
+                    r = cursor.fetchone()
+                    if not r:
+                        await update.message.reply_text('Запись не найдена для удаления.')
+                        context.user_data['delrecord_repeat_or_exit'] = True
+                    else:
+                        # r: (rowid, surname, name, ...)
+                        # Подготовим вставку в members_archive; сопоставляем колонки явно
+                        try:
+                            cursor.execute('''
+                                INSERT INTO members_archive (original_rowid, surname, name, patronymic, date_birth, group_disability, phone, address, area, "group", help_number, date_issue, validity_period, pension_number, ticket_number, date_entry, floor)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ''', (
+                                r[0],
+                                r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11], r[12], r[13], r[14], r[15], r[16]
+                            ))
+                        except Exception:
+                            await update.message.reply_text('Ошибка при архивировании записи. Удаление отменено.')
+                            context.user_data['delrecord_repeat_or_exit'] = True
+                            return
+                        # Если архивирование прошло успешно — удалить исходную запись
+                        cursor.execute('DELETE FROM members WHERE rowid = ?', (rowid,))
+                        await update.message.reply_text('Запись успешно удалена и перемещена в архив! Повторить удаление? 1. Да 2. Выход')
+                        context.user_data['delrecord_repeat_or_exit'] = True
             except Exception as e:
                 await update.message.reply_text(f'Ошибка при удалении: {e}')
                 context.user_data['delrecord_repeat_or_exit'] = True

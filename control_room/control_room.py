@@ -238,6 +238,31 @@ class ControlRoom:
                 pass
             raise
 
+    def _move_chart_to_archive(self, cursor, row_id) -> bool:
+        """Переместить запись из chart в chart_archive (копирование + удаление).
+
+        Возвращает True если запись была успешно перемещена, иначе False.
+        """
+        try:
+            cursor.execute('SELECT id, date, where_from, departure_time, "where", arrival_time, departure_datetime, customer, phone FROM chart WHERE id = ?', (row_id,))
+            row = cursor.fetchone()
+            if not row:
+                return False
+            # row: (id, date, where_from, departure_time, where, arrival_time, departure_datetime, customer, phone)
+            _, date_val, where_from_val, departure_time_val, where_val, arrival_time_val, departure_datetime_val, customer_val, phone_val = row
+            cursor.execute(
+                'INSERT INTO chart_archive (original_id, date, where_from, departure_time, "where", arrival_time, departure_datetime, customer, phone) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                (row_id, date_val, where_from_val, departure_time_val, where_val, arrival_time_val, departure_datetime_val, customer_val, phone_val)
+            )
+            cursor.execute('DELETE FROM chart WHERE id = ?', (row_id,))
+            return True
+        except Exception:
+            try:
+                self.logger.exception(f'Ошибка при перемещении записи chart id={row_id} в архив')
+            except Exception:
+                pass
+            return False
+
     async def start(self, update, context) -> None:
         # Проверяем роль пользователя, аналогично admin_message
         verifier = VerificationID()
@@ -271,18 +296,28 @@ class ControlRoom:
                 # Удалим просроченные заявки: если поле date заполнено и меньше текущей даты
                 try:
                     today_iso = date.today().isoformat()
-                    # Условие сравнения для ISO-строк корректно работает в SQLite
-                    cursor.execute('DELETE FROM chart WHERE date IS NOT NULL AND date <> "" AND date < ?', (today_iso,))
-                    try:
-                        deleted = cursor.rowcount
-                    except Exception:
-                        deleted = None
-                    if deleted:
-                        self.logger.info(f'Удалено просроченных заявок: {deleted}')
+                    # Архивируем просроченные заявки: сперва выбираем их id, затем по каждой переносим в chart_archive
+                    cursor.execute('SELECT id FROM chart WHERE date IS NOT NULL AND date <> "" AND date < ?', (today_iso,))
+                    expired = cursor.fetchall()
+                    archived_count = 0
+                    for er in expired:
+                        try:
+                            rid = er[0]
+                            moved = self._move_chart_to_archive(cursor, rid)
+                            if moved:
+                                archived_count += 1
+                        except Exception:
+                            # локально логируем и продолжаем
+                            try:
+                                self.logger.exception(f'Не удалось архивировать запись id={er[0]}')
+                            except Exception:
+                                pass
+                    if archived_count:
+                        self.logger.info(f'Архивировано просроченных заявок: {archived_count}')
                 except Exception:
-                    self.logger.exception('Ошибка при удалении просроченных заявок')
+                    self.logger.exception('Ошибка при архивировании просроченных заявок')
                     try:
-                        await notify_admin(context, 'Ошибка при удалении просроченных заявок (control_room)', traceback.format_exc())
+                        await notify_admin(context, 'Ошибка при архивировании просроченных заявок (control_room)', traceback.format_exc())
                     except Exception:
                         pass
 
@@ -476,8 +511,11 @@ class ControlRoom:
                     row_id = ids[sel - 1]
                     try:
                         with self.db.get_cursor() as cursor:
-                            cursor.execute('DELETE FROM chart WHERE id = ?', (row_id,))
-                        await self._send_and_track(context, msg, RECORD_DELETED)
+                            moved = self._move_chart_to_archive(cursor, row_id)
+                        if moved:
+                            await self._send_and_track(context, msg, RECORD_DELETED)
+                        else:
+                            await self._send_and_track(context, msg, 'Ошибка при удалении/архивации записи.')
                     except Exception as e:
                         await self._send_and_track(context, msg, f'Ошибка при удалении: {e}')
                 # очистим флаги и обновим список
@@ -1434,6 +1472,88 @@ class ControlRoom:
             # Затем покажем актуальный список (start сам отправит новое сообщение)
             await self.start(update, context)
             return
+        # Обработчик: вставить адрес из поля members (для выбранного заказчика) в поле заявки
+        if action == 'address_insert' and len(parts) >= 3:
+            sub = parts[2]
+            try:
+                if sub == 'from_member':
+                    direction = parts[3] if len(parts) >= 4 else 'отпр'
+                    # Проверим, есть ли выбранный заказчик в процессе создания
+                    cust_id = context.user_data.get('control_room_create_customer_id')
+                    if not cust_id:
+                        try:
+                            await query.answer('Заказчик не выбран', show_alert=True)
+                        except Exception:
+                            pass
+                        return
+                    # Получим адрес из карточки члена
+                    try:
+                        with self.db.get_cursor() as cur:
+                            cur.execute('SELECT address FROM members WHERE id = ?', (cust_id,))
+                            mr = cur.fetchone()
+                            addr_text = mr[0] if mr and mr[0] else None
+                            if not addr_text:
+                                try:
+                                    await query.answer('В карточке заказчика не найден адрес', show_alert=True)
+                                except Exception:
+                                    pass
+                                return
+                            # Сохраним адрес в таблице addresses, если ещё не существует
+                            cur.execute('SELECT id FROM addresses WHERE address = ?', (addr_text,))
+                            ar = cur.fetchone()
+                            if ar:
+                                addr_id = ar[0]
+                            else:
+                                cur.execute('INSERT INTO addresses (address) VALUES (?)', (addr_text,))
+                                addr_id = cur.lastrowid
+                            # Обновим/вставим привязку в customer_addresse
+                            try:
+                                cur.execute(
+                                    'INSERT INTO customer_addresse (customer_id, addresse_id, direction, rating) VALUES (?, ?, ?, 1) '
+                                    'ON CONFLICT(customer_id, addresse_id, direction) DO UPDATE SET rating = customer_addresse.rating + 1',
+                                    (cust_id, addr_id, direction)
+                                )
+                            except Exception:
+                                # не критично — продолжим
+                                pass
+                    except Exception:
+                        try:
+                            self.logger.exception('Ошибка при вставке адреса из members')
+                        except Exception:
+                            pass
+                        try:
+                            await query.answer('Ошибка при доступе к базе', show_alert=True)
+                        except Exception:
+                            pass
+                        return
+                    # Уведомим пользователя видимым сообщением и продвинем шаг создания
+                    sent = None
+                    try:
+                        # Попытка отправить краткое видимое подтверждение (не через _send_and_track), чтобы пользователь увидел факт вставки
+                        msg_obj = query.message if getattr(query, 'message', None) else (update.message if getattr(update, 'message', None) else None)
+                        if msg_obj:
+                            sent = await msg_obj.reply_text(f'Вставлен адрес: {addr_text}')
+                    except Exception:
+                        try:
+                            await query.answer(f'Вставлен адрес: {addr_text}', show_alert=False)
+                        except Exception:
+                            pass
+                    # Планируем удаление видимого подтверждения через 5 секунд (если удалось отправить)
+                    if sent:
+                        try:
+                            bot = getattr(context, 'bot', None)
+                            if bot and getattr(sent, 'chat', None):
+                                asyncio.create_task(self._delete_message_later(bot, sent.chat.id, sent.message_id, 5))
+                        except Exception:
+                            pass
+                    await self._advance_create_with_value(update, context, addr_text)
+                    return
+            except Exception:
+                try:
+                    self.logger.exception('Ошибка в обработчике address_insert')
+                except Exception:
+                    pass
+                return
         if action == 'delete' and len(parts) >= 3:
             try:
                 idx = int(parts[2])
@@ -1455,9 +1575,15 @@ class ControlRoom:
                 await self._safe_edit_query(query, context, 'Неверный индекс для удаления.')
                 return
             row_id = ids[idx - 1]
-            with self.db.get_cursor() as cur:
-                cur.execute('DELETE FROM chart WHERE id = ?', (row_id,))
-            await self._safe_edit_query(query, context, RECORD_DELETED)
+            try:
+                with self.db.get_cursor() as cur:
+                    moved = self._move_chart_to_archive(cur, row_id)
+                if moved:
+                    await self._safe_edit_query(query, context, RECORD_DELETED)
+                else:
+                    await self._safe_edit_query(query, context, 'Ошибка при удалении/архивации записи.')
+            except Exception:
+                await self._safe_edit_query(query, context, 'Ошибка при удалении/архивации записи.')
             # Обновим список (передаём Update)
             await self.start(update, context)
             return
@@ -1559,6 +1685,7 @@ class ControlRoom:
                 # Определим направление
                 direction = 'назн' if field_key == 'where' else 'отпр'
                 kb_small = InlineKeyboardMarkup([
+                    [InlineKeyboardButton('Вставить из БД', callback_data=f'control:address_insert:from_member:{direction}')],
                     [InlineKeyboardButton('📍 Показать все', callback_data=f'control:addresses:showall:{direction}')],
                     [InlineKeyboardButton('◀️ Назад', callback_data='control:back'), InlineKeyboardButton('❌ Отмена', callback_data='control:refresh')]
                 ])
@@ -1785,9 +1912,18 @@ class ControlRoom:
                     kb = self._build_addresses_markup(cust_id, include_show_all=True)
                     if kb:
                         await self._send_and_track(context, update.message, SELECT_ADDRESS_FROM, reply_markup=kb)
+                    else:
+                        # Если привязанных адресов нет — предложим кнопку "Показать все", кнопку "Вставить из БД" и "Отмена"
+                        kb = InlineKeyboardMarkup([
+                            [InlineKeyboardButton('Вставить из БД', callback_data=f'control:address_insert:from_member:отпр')],
+                            [InlineKeyboardButton('📍 Показать все', callback_data=f'control:addresses:showall:отпр')],
+                            [InlineKeyboardButton('◀️ Назад', callback_data='control:back'), InlineKeyboardButton('❌ Отмена', callback_data='control:refresh')]
+                        ])
+                        await self._send_and_track(context, update.message, SELECT_ADDRESS_FROM_MANUAL, reply_markup=kb)
                 else:
-                    # Если заказчик не выбран — всё равно предложим кнопку "Показать все" и "Отмена"
+                    # Если заказчик не выбран — всё равно предложим кнопку "Показать все", кнопку "Вставить из БД" и "Отмена"
                     kb = InlineKeyboardMarkup([
+                        [InlineKeyboardButton('Вставить из БД', callback_data=f'control:address_insert:from_member:отпр')],
                         [InlineKeyboardButton('📍 Показать все', callback_data=f'control:addresses:showall:отпр')],
                         [InlineKeyboardButton('◀️ Назад', callback_data='control:back'), InlineKeyboardButton('❌ Отмена', callback_data='control:refresh')]
                     ])
@@ -1936,8 +2072,9 @@ class ControlRoom:
                     if kb:
                         await self._send_and_track(context, msg, SELECT_ADDRESS_FROM, reply_markup=kb)
                     else:
-                        # Если привязанных адресов нет — предложим показать все
+                        # Если привязанных адресов нет — предложим показать все и кнопку 'Вставить из БД'
                         kb = InlineKeyboardMarkup([
+                            [InlineKeyboardButton('Вставить из БД', callback_data=f'control:address_insert:from_member:отпр')],
                             [InlineKeyboardButton('📍 Показать все', callback_data=f'control:addresses:showall:отпр')],
                             [InlineKeyboardButton('◀️ Назад', callback_data='control:back'), InlineKeyboardButton('❌ Отмена', callback_data='control:refresh')]
                         ])
@@ -1957,6 +2094,7 @@ class ControlRoom:
                         await self._send_and_track(context, msg, SELECT_ADDRESS_TO, reply_markup=kb)
                     else:
                         kb_fallback = InlineKeyboardMarkup([
+                            [InlineKeyboardButton('Вставить из БД', callback_data=f'control:address_insert:from_member:назн')],
                             [InlineKeyboardButton('📍 Показать все', callback_data=f'control:addresses:showall:назн')],
                             [InlineKeyboardButton('◀️ Назад', callback_data='control:back'), InlineKeyboardButton('❌ Отмена', callback_data='control:refresh')]
                         ])
@@ -2231,6 +2369,7 @@ class ControlRoom:
             # Включаем направление в callback, чтобы обработчик получил однозначно нужное направление
             kb.append([InlineKeyboardButton(label, callback_data=f'control:address:{aid}:{direction}')])
         # Добавим кнопку Показать все (всегда показываем) и кнопки Назад/Отмена
+        kb.append([InlineKeyboardButton('Вставить из БД', callback_data=f'control:address_insert:from_member:{direction}')])
         kb.append([InlineKeyboardButton('📍 Показать все', callback_data=f'control:addresses:showall:{direction}')])
         kb.append([InlineKeyboardButton('◀️ Назад', callback_data='control:back'), InlineKeyboardButton('❌ Отмена', callback_data='control:refresh')])
         return InlineKeyboardMarkup(kb)

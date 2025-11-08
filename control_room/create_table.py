@@ -176,6 +176,68 @@ async def ensure_chart_table(db: Database, update, context, logger: logging.Logg
                 logger.debug('ensure_chart_table: поле departure_datetime уже присутствует')
             # Убедимся в наличии таблиц addresses и customer_addresse
             _ensure_addresses_and_customer_tables(cursor, logger)
+            # Убедимся в наличии таблицы архива заявок chart_archive
+            try:
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='chart_archive'")
+                if not cursor.fetchone():
+                    cursor.execute('''
+                    CREATE TABLE chart_archive (
+                        archive_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        original_id INTEGER,
+                        date TEXT,
+                        where_from TEXT,
+                        departure_time TEXT,
+                        "where" TEXT,
+                        arrival_time TEXT,
+                        departure_datetime TEXT,
+                        customer TEXT,
+                        phone TEXT,
+                        archived_at TEXT DEFAULT CURRENT_TIMESTAMP
+                    )
+                    ''')
+                    logger.info('Создана таблица chart_archive')
+            except Exception:
+                logger.exception('Ошибка при создании таблицы chart_archive')
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(notify_admin(context, 'Ошибка при создании таблицы chart_archive (create_table)', traceback.format_exc()))
+                except Exception:
+                    pass
+            # Убедимся в наличии таблицы архива для членов members_archive
+            try:
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='members_archive'")
+                if not cursor.fetchone():
+                    cursor.execute('''
+                    CREATE TABLE members_archive (
+                        archive_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        original_rowid INTEGER,
+                        surname TEXT,
+                        name TEXT,
+                        patronymic TEXT,
+                        date_birth TEXT,
+                        group_disability TEXT,
+                        phone TEXT,
+                        address TEXT,
+                        area TEXT,
+                        "group" TEXT,
+                        help_number TEXT,
+                        date_issue TEXT,
+                        validity_period TEXT,
+                        pension_number TEXT,
+                        ticket_number TEXT,
+                        date_entry TEXT,
+                        floor TEXT,
+                        archived_at TEXT DEFAULT CURRENT_TIMESTAMP
+                    )
+                    ''')
+                    logger.info('Создана таблица members_archive')
+            except Exception:
+                logger.exception('Ошибка при создании таблицы members_archive')
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(notify_admin(context, 'Ошибка при создании таблицы members_archive (create_table)', traceback.format_exc()))
+                except Exception:
+                    pass
     except Exception:
         msg = update.callback_query.message if getattr(update, 'callback_query', None) else update.message
         logger.exception('Ошибка доступа к базе данных при обеспечении таблицы chart')
