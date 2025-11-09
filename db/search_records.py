@@ -1,10 +1,21 @@
+import logging
+from utils.admin_messenger import send_and_track, delete_tracked_messages
+
+logger = logging.getLogger(__name__)
+
+
 class SearchRecords:
     db_fields = [
         "surname", "name", "patronymic", "date_birth", "group_disability", "phone", "address", "area", "`group`", "help_number", "date_issue", "validity_period", "pension_number", "ticket_number", "date_entry", "floor"
     ]
 
     async def start_search(self, update, context):
-        await update.message.reply_text('Введите фамилию для поиска:')
+        # Отправим приглашение (send_and_track удалит старые сообщения перед отправкой)
+        try:
+            await send_and_track(context, update.message, 'Введите фамилию для поиска:')
+        except Exception:
+            logger.exception('start_search: send_and_track failed; falling back to reply_text')
+            await update.message.reply_text('Введите фамилию для поиска:')
         context.user_data['searchrecords_awaiting_surname'] = True
 
     async def handle_surname_search(self, update, context):
@@ -16,7 +27,10 @@ class SearchRecords:
                 cursor.execute('SELECT rowid, ' + ', '.join(self.db_fields) + ' FROM members WHERE LOWER(surname) LIKE LOWER(?)', (surname + '%',))
                 rows = cursor.fetchall()
                 if not rows:
-                    await update.message.reply_text('Совпадений не найдено. 1. Повторить поиск 2. Выход')
+                    try:
+                        await send_and_track(context, update.message, 'Совпадений не найдено. 1. Повторить поиск 2. Выход')
+                    except Exception:
+                        await update.message.reply_text('Совпадений не найдено. 1. Повторить поиск 2. Выход')
                     context.user_data['searchrecords_repeat_or_exit'] = True
                     context.user_data['searchrecords_awaiting_surname'] = False
                     return
@@ -24,14 +38,20 @@ class SearchRecords:
                 if len(rows) == 1:
                     row = rows[0]
                     await self.show_full_record(update, row)
-                    await update.message.reply_text('1. Повторить поиск\n2. Выход')
+                    try:
+                        await send_and_track(context, update.message, '1. Повторить поиск\n2. Выход')
+                    except Exception:
+                        await update.message.reply_text('1. Повторить поиск\n2. Выход')
                     context.user_data['searchrecords_repeat_or_exit'] = True
                 else:
                     msg = 'Результаты поиска:\n'
                     for idx, row in enumerate(rows, 1):
                         msg += f"{idx}. {row[1]} {row[2]} {row[3]}\n"
                     msg += 'Введите номер нужной записи:'
-                    await update.message.reply_text(msg)
+                    try:
+                        await send_and_track(context, update.message, msg)
+                    except Exception:
+                        await update.message.reply_text(msg)
                     context.user_data['searchrecords_awaiting_choice'] = True
         except Exception as e:
             await update.message.reply_text(f'Ошибка при поиске: {e}')
@@ -49,7 +69,10 @@ class SearchRecords:
             return
         row = results[idx-1]
         await self.show_full_record(update, row)
-        await update.message.reply_text('1. Повторить поиск\n2. Выход')
+        try:
+            await send_and_track(context, update.message, '1. Повторить поиск\n2. Выход')
+        except Exception:
+            await update.message.reply_text('1. Повторить поиск\n2. Выход')
         context.user_data['searchrecords_awaiting_choice'] = False
         context.user_data['searchrecords_repeat_or_exit'] = True
 

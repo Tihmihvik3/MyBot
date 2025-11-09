@@ -1936,8 +1936,9 @@ class ControlRoom:
                     if kb:
                         await self._send_and_track(context, update.message, SELECT_ADDRESS_TO, reply_markup=kb)
                     else:
-                        # Нет привязанных адресов, но предложим показать все
+                        # Нет привязанных адресов: предложим кнопку "Вставить из БД", кнопку "Показать все" и действия
                         kb_fallback = InlineKeyboardMarkup([
+                            [InlineKeyboardButton('Вставить из БД', callback_data=f'control:address_insert:from_member:назн')],
                             [InlineKeyboardButton('📍 Показать все', callback_data=f'control:addresses:showall:назн')],
                             [InlineKeyboardButton('◀️ Назад', callback_data='control:back'), InlineKeyboardButton('❌ Отмена', callback_data='control:refresh')]
                         ])

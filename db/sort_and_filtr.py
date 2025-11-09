@@ -1,4 +1,5 @@
 import logging
+from utils.message_cleanup import cleanup_admin_messages
 from db.database import Database
 from telegram import InlineKeyboardMarkup, InlineKeyboardButton
 import traceback
@@ -12,10 +13,20 @@ class SortAndFiltr:
     PAGE_SIZE_DEFAULT = 20
 
     async def start(self, update, context):
+        # Очистим предыдущие админские сообщения
+        try:
+            await cleanup_admin_messages(context, bot=context.bot, logger_obj=logger)
+        except Exception:
+            logger.exception('SortAndFiltr.start: cleanup failed')
         await update.message.reply_text('Выберите действие:\n1. Сортировать по\n2. Фильтровать по\n0. Выйти')
         context.user_data['sortfiltr_awaiting_action'] = True  # Ожидаем действие пользователя
         
     async def handle_action(self, update, context):
+        # Удалим старые админские сообщения перед отправкой меню/результатов
+        try:
+            await cleanup_admin_messages(context, bot=context.bot, logger_obj=logger)
+        except Exception:
+            logger.exception('handle_action: cleanup failed')
         # Сохраняем выбор в context.user_data, чтобы не использовать глобальную переменную класса
         context.user_data['sortfiltr_choice'] = update.message.text.strip()
         # Сбрасываем параметры пагинации при новом выборе
@@ -167,6 +178,11 @@ class SortAndFiltr:
         title: заголовок сообщения для пользователя
         current_sort_key: ключ для context.user_data['sortfiltr_current_sort']
         """
+        # Перед отправкой страниц и сообщений обнулим старые админские сообщения
+        try:
+            await cleanup_admin_messages(context, bot=context.bot, logger_obj=logger)
+        except Exception:
+            logger.exception('_paginate_query: cleanup failed')
         db = Database()
         try:
             page = context.user_data.get('sortfiltr_page', 1)

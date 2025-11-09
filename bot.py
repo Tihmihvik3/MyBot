@@ -61,6 +61,7 @@ async def help_callback(update, context):
     # Обработчик для inline-кнопки Справка / Закрыть справку
     query = update.callback_query
     data = getattr(query, 'data', '')
+    logging.info(f"admin_callback received callback data: {data!r} from user_id={getattr(query.from_user,'id',None)}")
     try:
         await query.answer()
     except Exception:
@@ -190,9 +191,69 @@ async def admin_message(update, context):
     verifier = VerificationID()
     USER_ROLE = await verifier.check_role(update, context)
     if USER_ROLE in ("admin", "super admin"):
-        await update.message.reply_text("Режим администратора: доступ разрешён.")
-        await update.message.reply_text(
-            "Выберите действие:\n1. Показать весь список.\n2. Найти по фамилии.\n3. Редактировать запись.\n4. Добавить запись.\n5. Удалить запись.\n6. Сортировка и фильтр.\nВведите номер действия:")
+        # Удаляем ранее отправленные служебные/админ-сообщения перед выводом нового меню,
+        # кроме приветственного сообщения "Добро пожаловать...".
+        try:
+            # список возможных ключей где хранятся message ids
+            keys = ['control_menu_message', 'control_help_message', 'workdb_entries_message', 'workdb_pages_message']
+            # собираем id приветственных сообщений, чтобы их не удалять
+            greeting_ids = set()
+            try:
+                for item in context.chat_data.get('control_room_sent_messages', []):
+                    # item может быть dict {'chat_id':..., 'message_id':..., 'text':...}
+                    if isinstance(item, dict) and item.get('text', '').startswith('Добро пожаловать'):
+                        greeting_ids.add(item.get('message_id'))
+            except Exception:
+                pass
+            for k in keys:
+                val = context.user_data.get(k)
+                if not val:
+                    continue
+                try:
+                    # val может быть tuple (chat_id, message_id) or list/tuple
+                    if isinstance(val, (list, tuple)) and len(val) >= 2:
+                        cid, mid = val[0], val[1]
+                        if mid in greeting_ids:
+                            continue
+                        try:
+                            await context.bot.delete_message(chat_id=cid, message_id=mid)
+                        except Exception:
+                            # игнорируем ошибки удаления
+                            pass
+                    # удалим ключы из user_data
+                    context.user_data.pop(k, None)
+                except Exception:
+                    try:
+                        logging.exception('Failed to cleanup admin message %s', k)
+                    except Exception:
+                        pass
+        except Exception:
+            try:
+                logging.exception('Error while cleaning previous admin messages')
+            except Exception:
+                pass
+        # Отправляем сообщение и Inline-клавиатуру с действиями (кнопки отправляют callback_data 'admin:1'..'admin:6')
+        try:
+            sent_header = await update.message.reply_text("Режим администратора: доступ разрешён.")
+            # Сохраним id заголовочного сообщения админа, чтобы его можно было удалять при показе списков
+            if getattr(sent_header, 'chat', None):
+                context.user_data['admin_header_message'] = (sent_header.chat.id, sent_header.message_id)
+        except Exception:
+            logging.exception('Не удалось отправить заголовок режима администратора')
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton('1. Показать весь список', callback_data='admin:1')],
+            [InlineKeyboardButton('2. Найти по фамилии', callback_data='admin:2')],
+            [InlineKeyboardButton('3. Редактировать запись', callback_data='admin:3')],
+            [InlineKeyboardButton('4. Добавить запись', callback_data='admin:4')],
+            [InlineKeyboardButton('5. Удалить запись', callback_data='admin:5')],
+            [InlineKeyboardButton('6. Сортировка и фильтр', callback_data='admin:6')]
+        ])
+        try:
+            sent_menu = await update.message.reply_text('Выберите действие:', reply_markup=kb)
+            if getattr(sent_menu, 'chat', None):
+                context.user_data['admin_menu_message'] = (sent_menu.chat.id, sent_menu.message_id)
+        except Exception:
+            logging.exception('Не удалось отправить меню администратора')
         context.user_data['admin_mode'] = True
     else:
         await update.message.reply_text("Эта команда вам не доступна. Обратитесь к администратору бота.")
@@ -204,6 +265,11 @@ async def admin_action_handler(update, context):
     """
     from db.sort_and_filtr import SortAndFiltr
     sortfiltr = SortAndFiltr()
+    try:
+        logging.info(f"admin_action_handler entered; message_text={(update.message.text if getattr(update, 'message', None) else None)!r}; admin_mode={context.user_data.get('admin_mode')}")
+    except Exception:
+        logging.exception('admin_action_handler: error logging entry state')
+
     # --- Делегируем обработку состояния ControlRoom ---
     from control_room.control_room import ControlRoom
     control = ControlRoom()
@@ -257,6 +323,267 @@ async def admin_action_handler(update, context):
         # Прямой вход в диспетчерскую теперь обрабатывается отдельным handler'ом (control_entry)
         else:
                 await work_db.handle_admin_action(update, context)
+
+async def admin_callback(update, context):
+    """
+    Конвертируем CallbackQuery от inline-кнопок администратора (admin:1..6)
+    в поведение эквивалентного текстового сообщения и вызываем
+    `admin_action_handler` для дальнейшей обработки.
+    """
+    query = update.callback_query
+    data = getattr(query, 'data', '')
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    # формат данных: admin:<num>
+    parts = data.split(':')
+    if len(parts) < 2:
+        return
+    choice = parts[1]
+
+    # Попытаться подготовить дополнительные данные для downstream-кода.
+    # Не присваиваем `update.message`, т.к. Update запрещает динамическое
+    # добавление атрибутов в этой версии библиотеки (вызывало AttributeError).
+    msg = getattr(query, 'message', None)
+    if msg:
+        try:
+            msg.from_user = query.from_user
+        except Exception:
+            pass
+        try:
+            msg.text = choice
+        except Exception:
+            pass
+
+    logging.info(f"admin_callback calling admin_action_handler with choice={choice!r}; has_query_message={bool(msg)}; has_update_message={bool(getattr(update,'message',None))}")
+
+    # Быстрая-path: если нажата кнопка '1' (Показать весь список), вызовем
+    # соответствующий метод напрямую. Подстраховываемся — если update.message
+    # отсутствует, создаём простой прокси-объект с reply_text, который делегирует
+    # на context.bot.send_message.
+    if choice == '1':
+        try:
+            from db.work_db import WorkDB
+            work = WorkDB()
+            # Просто вызываем метод — внутри есть fallback для случая, когда
+            # update.message отсутствует (будет использован context.bot)
+            await work.show_sorted_by_surname(update, context)
+            return
+        except Exception:
+            logging.exception('admin_callback: direct call to WorkDB.show_sorted_by_surname failed')
+            # Падение — уведомим пользователя коротким сообщением и выйдем
+            try:
+                chat_id = msg.chat.id if msg and getattr(msg, 'chat', None) else getattr(query.from_user, 'id', None)
+                if chat_id:
+                    await context.bot.send_message(chat_id=chat_id, text='Ошибка при формировании списка. Подробности в логах.')
+            except Exception:
+                pass
+            return
+
+    if choice == '2':
+        try:
+            from db.search_records import SearchRecords
+            sr = SearchRecords()
+            # If we have update.message already, call directly
+            if getattr(update, 'message', None):
+                await sr.start_search(update, context)
+            else:
+                # Build a minimal fake update with message.reply_text delegating to bot.send_message
+                class _ProxyMsg:
+                    def __init__(self, chat_id, bot):
+                        self.chat = type('C', (), {'id': chat_id})
+                        self._bot = bot
+                    async def reply_text(self, text):
+                        return await self._bot.send_message(chat_id=self.chat.id, text=text)
+                class _FakeUpdate:
+                    pass
+                chat_id = query.message.chat.id if getattr(query, 'message', None) and getattr(query.message, 'chat', None) else getattr(query.from_user, 'id', None)
+                fake = _FakeUpdate()
+                fake.message = _ProxyMsg(chat_id, context.bot)
+                fake.callback_query = query
+                fake.effective_user = query.from_user
+                await sr.start_search(fake, context)
+            return
+        except Exception:
+            logging.exception('admin_callback: direct call to SearchRecords.start_search failed')
+            try:
+                chat_id = msg.chat.id if msg and getattr(msg, 'chat', None) else getattr(query.from_user, 'id', None)
+                if chat_id:
+                    await context.bot.send_message(chat_id=chat_id, text='Ошибка при запуске поиска. Подробности в логах.')
+            except Exception:
+                pass
+            return
+
+    # Быстрые пути для других admin-кнопок (3..6)
+    if choice == '3':
+        try:
+            # EditDB: запрос фамилии и запуск режима редактирования
+            from db.edit_db import EditDB
+            ed = EditDB()
+            if getattr(update, 'message', None):
+                await ed.search_and_show_fields(update, context)
+            else:
+                # Построим минимальный fake update, как в case '2'
+                class _ProxyMsg:
+                    def __init__(self, chat_id, bot):
+                        self.chat = type('C', (), {'id': chat_id})
+                        self._bot = bot
+                    async def reply_text(self, text):
+                        return await self._bot.send_message(chat_id=self.chat.id, text=text)
+                class _FakeUpdate:
+                    pass
+                chat_id = query.message.chat.id if getattr(query, 'message', None) and getattr(query.message, 'chat', None) else getattr(query.from_user, 'id', None)
+                fake = _FakeUpdate()
+                fake.message = _ProxyMsg(chat_id, context.bot)
+                fake.callback_query = query
+                fake.effective_user = query.from_user
+                await ed.search_and_show_fields(fake, context)
+            return
+        except Exception:
+            logging.exception('admin_callback: direct call to EditDB.search_and_show_fields failed')
+            try:
+                chat_id = msg.chat.id if msg and getattr(msg, 'chat', None) else getattr(query.from_user, 'id', None)
+                if chat_id:
+                    await context.bot.send_message(chat_id=chat_id, text='Ошибка при запуске режима редактирования. Подробности в логах.')
+            except Exception:
+                pass
+            return
+
+    if choice == '4':
+        try:
+            from db.add_record import AddRecord
+            ar = AddRecord()
+            if getattr(update, 'message', None):
+                await ar.start_add(update, context)
+            else:
+                class _ProxyMsg:
+                    def __init__(self, chat_id, bot):
+                        self.chat = type('C', (), {'id': chat_id})
+                        self._bot = bot
+                    async def reply_text(self, text):
+                        return await self._bot.send_message(chat_id=self.chat.id, text=text)
+                class _FakeUpdate:
+                    pass
+                chat_id = query.message.chat.id if getattr(query, 'message', None) and getattr(query.message, 'chat', None) else getattr(query.from_user, 'id', None)
+                fake = _FakeUpdate()
+                fake.message = _ProxyMsg(chat_id, context.bot)
+                fake.callback_query = query
+                fake.effective_user = query.from_user
+                await ar.start_add(fake, context)
+            return
+        except Exception:
+            logging.exception('admin_callback: direct call to AddRecord.start_add failed')
+            try:
+                chat_id = msg.chat.id if msg and getattr(msg, 'chat', None) else getattr(query.from_user, 'id', None)
+                if chat_id:
+                    await context.bot.send_message(chat_id=chat_id, text='Ошибка при запуске добавления записи. Подробности в логах.')
+            except Exception:
+                pass
+            return
+
+    if choice == '5':
+        try:
+            from db.del_record import DelRecord
+            dr = DelRecord()
+            if getattr(update, 'message', None):
+                await dr.start_delete(update, context)
+            else:
+                class _ProxyMsg:
+                    def __init__(self, chat_id, bot):
+                        self.chat = type('C', (), {'id': chat_id})
+                        self._bot = bot
+                    async def reply_text(self, text):
+                        return await self._bot.send_message(chat_id=self.chat.id, text=text)
+                class _FakeUpdate:
+                    pass
+                chat_id = query.message.chat.id if getattr(query, 'message', None) and getattr(query.message, 'chat', None) else getattr(query.from_user, 'id', None)
+                fake = _FakeUpdate()
+                fake.message = _ProxyMsg(chat_id, context.bot)
+                fake.callback_query = query
+                fake.effective_user = query.from_user
+                await dr.start_delete(fake, context)
+            return
+        except Exception:
+            logging.exception('admin_callback: direct call to DelRecord.start_delete failed')
+            try:
+                chat_id = msg.chat.id if msg and getattr(msg, 'chat', None) else getattr(query.from_user, 'id', None)
+                if chat_id:
+                    await context.bot.send_message(chat_id=chat_id, text='Ошибка при запуске удаления записи. Подробности в логах.')
+            except Exception:
+                pass
+            return
+
+    if choice == '6':
+        try:
+            # SortAndFiltr.start
+            from db.sort_and_filtr import SortAndFiltr
+            sf = SortAndFiltr()
+            if getattr(update, 'message', None):
+                await sf.start(update, context)
+            else:
+                class _ProxyMsg:
+                    def __init__(self, chat_id, bot):
+                        self.chat = type('C', (), {'id': chat_id})
+                        self._bot = bot
+                    async def reply_text(self, text):
+                        return await self._bot.send_message(chat_id=self.chat.id, text=text)
+                class _FakeUpdate:
+                    pass
+                chat_id = query.message.chat.id if getattr(query, 'message', None) and getattr(query.message, 'chat', None) else getattr(query.from_user, 'id', None)
+                fake = _FakeUpdate()
+                fake.message = _ProxyMsg(chat_id, context.bot)
+                fake.callback_query = query
+                fake.effective_user = query.from_user
+                await sf.start(fake, context)
+            return
+        except Exception:
+            logging.exception('admin_callback: direct call to SortAndFiltr.start failed')
+            try:
+                chat_id = msg.chat.id if msg and getattr(msg, 'chat', None) else getattr(query.from_user, 'id', None)
+                if chat_id:
+                    await context.bot.send_message(chat_id=chat_id, text='Ошибка при запуске сортировки/фильтра. Подробности в логах.')
+            except Exception:
+                pass
+            return
+
+    # Fallback: вызвать общий обработчик (имитируем текстовое сообщение)
+    try:
+        # If original Update has no message (CallbackQuery case), create a lightweight
+        # proxy message that contains `.text` equal to the chosen menu number and
+        # a `.reply_text` that delegates to bot.send_message. This avoids mutating
+        # the real Update/Message objects (which may raise AttributeError) and
+        # ensures downstream handlers that access `update.message.text` work.
+        if not getattr(update, 'message', None):
+            class _ProxyMsg:
+                def __init__(self, chat_id, bot, text, from_user):
+                    self.chat = type('C', (), {'id': chat_id})
+                    self._bot = bot
+                    self.text = text
+                    self.from_user = from_user
+                async def reply_text(self, text, **kwargs):
+                    return await self._bot.send_message(chat_id=self.chat.id, text=text, **kwargs)
+            class _FakeUpdate:
+                pass
+            chat_id = query.message.chat.id if getattr(query, 'message', None) and getattr(query.message, 'chat', None) else getattr(query.from_user, 'id', None)
+            fake = _FakeUpdate()
+            fake.message = _ProxyMsg(chat_id, context.bot, choice, query.from_user)
+            fake.callback_query = query
+            fake.effective_user = query.from_user
+            await admin_action_handler(fake, context)
+        else:
+            await admin_action_handler(update, context)
+    except Exception:
+        logging.exception('admin_callback: admin_action_handler failed')
+        try:
+            chat_id = msg.chat.id if msg and getattr(msg, 'chat', None) else getattr(query.from_user, 'id', None)
+            if chat_id:
+                await context.bot.send_message(chat_id=chat_id, text='Ошибка при обработке действия администратора. Подробности в логах.')
+        except Exception:
+            pass
+    return
+    
 
 
 async def control_entry(update, context):
@@ -316,6 +643,8 @@ def main():
     from control_room.control_room import ControlRoom
     control = ControlRoom()
     application.add_handler(CallbackQueryHandler(control.handle_callback, pattern=r'^control:'))
+    # CallbackQuery для inline-кнопок администратора (admin:1..6)
+    application.add_handler(CallbackQueryHandler(admin_callback, pattern=r'^admin:'))
     # CallbackQuery для inline-кнопки Справка (show/close)
     application.add_handler(CallbackQueryHandler(help_callback, pattern=r'^help:'))
     # CallbackQuery для inline-кнопки Меню бота (show/close)
@@ -326,6 +655,10 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'(?i)фото'), photo_message))
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'(?i)видео'), video_message))
     # Цифровой ряд больше не используется — обработчики удалены
+    # workdb callbacks (list pages, member selection, exit)
+    from db.work_db import WorkDB
+    workdb = WorkDB()
+    application.add_handler(CallbackQueryHandler(workdb.handle_callback, pattern=r'^workdb:'))
 
     logging.info("Бот стартовал")
 

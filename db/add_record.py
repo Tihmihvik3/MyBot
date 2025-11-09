@@ -1,3 +1,9 @@
+import logging
+from utils.admin_messenger import send_and_track, delete_tracked_messages
+
+logger = logging.getLogger(__name__)
+
+
 class AddRecord:
     fields = [
         "Фамилия", "Имя", "Отчество", "Дата рождения", "Группа инвалидности", "Телефон", "Адрес", "Район", "Группа", "Справка МСЭ", "Дата выдачи справки МСЭ", "Срок действия справки МСЭ", "Пенсионное удостоверение", "Номер членского билета", "Дата вступления", "Пол"
@@ -7,9 +13,14 @@ class AddRecord:
     ]
 
     async def start_add(self, update, context):
+        # Отправим приглашение через send_and_track (он удалит старые admin-сообщения)
         context.user_data['add_record_data'] = {}
         context.user_data['add_record_step'] = 0
-        await update.message.reply_text(f'Введите {self.fields[0]}:')
+        try:
+            await send_and_track(context, update.message, f'Введите {self.fields[0]}:')
+        except Exception:
+            logger.exception('start_add: send_and_track failed; falling back')
+            await update.message.reply_text(f'Введите {self.fields[0]}:')
         context.user_data['add_record_in_progress'] = True
 
     async def handle_add_step(self, update, context):
@@ -36,9 +47,15 @@ class AddRecord:
                 msg = 'Запись успешно добавлена!\nСохранённые данные:\n'
                 for i, field in enumerate(self.fields):
                     msg += f"{field}: {data.get(self.db_fields[i], '')}\n"
-                await update.message.reply_text(msg)
+                try:
+                    await send_and_track(context, update.message, msg)
+                except Exception:
+                    await update.message.reply_text(msg)
                 # Предложить продолжить или выйти
-                await update.message.reply_text('Выберите действие:\n1. Продолжить добавление записей\n2. Выход')
+                try:
+                    await send_and_track(context, update.message, 'Выберите действие:\n1. Продолжить добавление записей\n2. Выход')
+                except Exception:
+                    await update.message.reply_text('Выберите действие:\n1. Продолжить добавление записей\n2. Выход')
                 context.user_data['add_record_continue_or_exit'] = True
             except Exception as e:
                 await update.message.reply_text(f'Ошибка при добавлении: {e}')
