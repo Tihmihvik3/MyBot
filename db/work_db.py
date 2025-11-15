@@ -118,7 +118,7 @@ class WorkDB:
             except Exception:
                 self.logger.exception('Не удалось уведомить пользователя об ошибке сортировки')
 
-    async def _send_user_list(self, update, context, rows):
+    async def _send_user_list(self, update, context, rows, page: int = 1):
         """
         Формирует и отправляет список пользователей, отсортированный по фамилии.
         """
@@ -136,9 +136,14 @@ class WorkDB:
             total = len(rows)
             total_pages = (total + context.user_data['workdb_page_size'] - 1) // context.user_data['workdb_page_size']
             context.user_data['workdb_total_pages'] = total_pages
-            context.user_data['workdb_current_page'] = 1
+            # Установим текущую страницу (по умолчанию передаётся 1)
+            if page < 1:
+                page = 1
+            if page > total_pages:
+                page = total_pages
+            context.user_data['workdb_current_page'] = page
 
-            header = f'Список пользователей (отсортировано по фамилии):\nСтраница 1 из {total_pages}'
+            header = f'Список пользователей (отсортировано по фамилии):\nСтраница {page} из {total_pages}'
             # Отправим заголовок с клавиатурой для первой страницы
             # Перед отправкой удалим ранее отправленные сообщения списка (entries/pages), чтобы не мусорить чат
             # Если вызов пришёл из CallbackQuery (нажатие inline-кнопки администратора),
@@ -194,14 +199,14 @@ class WorkDB:
                     pass
 
             # Клавиатура записей (только записи текущей страницы)
-            kb_entries = self._build_list_keyboard(rows, page=1, page_size=context.user_data['workdb_page_size'])
+            kb_entries = self._build_list_keyboard(rows, page=page, page_size=context.user_data['workdb_page_size'])
             # Клавиатура страниц (вторая строка сообщений)
             kb_pages = self._build_pages_keyboard(total_pages)
             try:
                 # Отправляем два сообщения: 1) заголовок + клавиатура записей, 2) текст с номером страницы + клавиатура страниц
                 if getattr(update, 'message', None):
                     sent_entries = await update.message.reply_text(header, reply_markup=kb_entries)
-                    sent_pages = await update.message.reply_text(f'Страница 1 из {total_pages}', reply_markup=kb_pages)
+                    sent_pages = await update.message.reply_text(f'Страница {page} из {total_pages}', reply_markup=kb_pages)
                 else:
                     # fallback: отправим через bot.send_message
                     user = getattr(update, 'effective_user', None)
@@ -212,7 +217,7 @@ class WorkDB:
                         chat_id = update.callback_query.from_user.id
                     if chat_id:
                         sent_entries = await context.bot.send_message(chat_id=chat_id, text=header, reply_markup=kb_entries)
-                        sent_pages = await context.bot.send_message(chat_id=chat_id, text=f'Страница 1 из {total_pages}', reply_markup=kb_pages)
+                        sent_pages = await context.bot.send_message(chat_id=chat_id, text=f'Страница {page} из {total_pages}', reply_markup=kb_pages)
                     else:
                         raise RuntimeError('No chat_id available for sending user list')
                 # Сохраним id сообщений, чтобы в callback'е можно было редактировать клавиатуры и текст
@@ -305,6 +310,287 @@ class WorkDB:
         if len(parts) < 2:
             return
         kind = parts[1]
+
+        # Перенаправим callback'ы editdb:* в EditDB
+        if data.startswith('editdb:'):
+            try:
+                from db.edit_db import EditDB
+                edit_db = EditDB()
+                # Передаём полный update (callback_query) в метод обработки
+                await edit_db.process_field_callback(update, context) if data.startswith('editdb:field:') else await edit_db.handle_cancel_callback(update, context)
+            except Exception:
+                try:
+                    self.logger.exception('handle_callback: failed to delegate editdb callback')
+                except Exception:
+                    pass
+            return
+
+        # Обработка callback'ов для AddRecord (workdb:add:cancel / workdb:add:back)
+        if kind == 'add' and len(parts) >= 3:
+            action = parts[2]
+            # Отмена добавления — вернуть в админ-меню, удалить prompt
+            if action == 'cancel':
+                try:
+                    try:
+                        await query.message.delete()
+                    except Exception:
+                        pass
+                    # удалить сохранённый prompt, если есть
+                    try:
+                        prev = context.user_data.pop('add_record_prompt_message', None)
+                        if prev and isinstance(prev, (list, tuple)) and len(prev) >= 2:
+                            try:
+                                await context.bot.delete_message(chat_id=prev[0], message_id=prev[1])
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    # удалить заголовок 'Заполнение карточки', если есть
+                    try:
+                        hdr = context.user_data.pop('add_record_header_message', None)
+                        if hdr and isinstance(hdr, (list, tuple)) and len(hdr) >= 2:
+                            try:
+                                await context.bot.delete_message(chat_id=hdr[0], message_id=hdr[1])
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    # сбросим состояния add_record
+                    context.user_data.pop('add_record_in_progress', None)
+                    context.user_data.pop('add_record_step', None)
+                    context.user_data.pop('add_record_data', None)
+                    from bot import admin_message
+                    fake = type('F', (), {})()
+                    fake.callback_query = query
+                    fake.message = query.message
+                    await admin_message(fake, context)
+                except Exception:
+                    try:
+                        self.logger.exception('handle_callback: failed to cancel add_record')
+                    except Exception:
+                        pass
+                return
+
+            # Назад — вернуться к предыдущему шагу ввода
+            if action == 'back':
+                try:
+                    # удалим текущее сообщение-приглашение
+                    try:
+                        await query.message.delete()
+                    except Exception:
+                        pass
+                    step = context.user_data.get('add_record_step', 0)
+                    if step is None:
+                        step = 0
+                    # если мы на шаге >0 — вернёмся на предыдущий
+                    if step > 0:
+                        new_step = step - 1
+                        # удалим ранее введённое значение для этого шага (если оно было)
+                        try:
+                            data = context.user_data.get('add_record_data', {}) or {}
+                            db_fields = None
+                            try:
+                                from db.add_record import AddRecord as _AR
+                                db_fields = _AR.db_fields
+                            except Exception:
+                                # fallback: try to read from current module's constant
+                                db_fields = []
+                            if db_fields and new_step < len(db_fields):
+                                key = db_fields[new_step]
+                                try:
+                                    data.pop(key, None)
+                                except Exception:
+                                    pass
+                            context.user_data['add_record_data'] = data
+                            context.user_data['add_record_step'] = new_step
+                        except Exception:
+                            pass
+                        # Показать prompt для предыдущего шага
+                        try:
+                            from db.add_record import AddRecord
+                            ar = AddRecord()
+                            fake = type('F', (), {})()
+                            fake.message = query.message
+                            fake.callback_query = query
+                            await ar.ask_step(fake, context, new_step)
+                        except Exception:
+                            try:
+                                self.logger.exception('handle_callback: failed to re-show add_record previous step')
+                            except Exception:
+                                pass
+                    else:
+                        # если нет предыдущего шага — вернём в админ-меню
+                        # удалить заголовок карточки, если он есть
+                        try:
+                            hdr = context.user_data.pop('add_record_header_message', None)
+                            if hdr and isinstance(hdr, (list, tuple)) and len(hdr) >= 2:
+                                try:
+                                    await context.bot.delete_message(chat_id=hdr[0], message_id=hdr[1])
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                        from bot import admin_message
+                        fake = type('F', (), {})()
+                        fake.callback_query = query
+                        fake.message = query.message
+                        await admin_message(fake, context)
+                except Exception:
+                    try:
+                        self.logger.exception('handle_callback: unexpected error handling add:back')
+                    except Exception:
+                        pass
+                return
+
+        # Обработка callback'ов подтверждения удаления delrec:yes:<id> / delrec:no:<id>
+        if data.startswith('delrec:'):
+            try:
+                parts2 = data.split(':')
+                if len(parts2) >= 3:
+                    action = parts2[1]
+                    member_id = None
+                    try:
+                        member_id = int(parts2[2])
+                    except Exception:
+                        member_id = None
+                    # 'no' — просто удалить сообщение подтверждения
+                    if action == 'no':
+                        try:
+                            # лог: получили callback no
+                            try:
+                                self.logger.info(f"delrec:no callback received for member_id={member_id}; query_message_id={getattr(query.message, 'message_id', None)}")
+                            except Exception:
+                                pass
+                            # удаляем текущее сообщение (callback message)
+                            deleted_query_msg = False
+                            try:
+                                await query.message.delete()
+                                deleted_query_msg = True
+                            except Exception as ex:
+                                try:
+                                    self.logger.debug(f"delrec:no: failed to delete query.message -> {ex}")
+                                except Exception:
+                                    pass
+                                # fallback: попробуем убрать клавиатуру у сообщения, если удалить не удалось
+                                try:
+                                    await query.message.edit_reply_markup(reply_markup=None)
+                                except Exception:
+                                    pass
+                            # также удалить сохранённое сообщение подтверждения, если есть
+                            try:
+                                conf = context.user_data.pop('delrec_confirm_message', None)
+                                if conf and isinstance(conf, (list, tuple)) and len(conf) >= 2:
+                                    try:
+                                        try:
+                                            await context.bot.delete_message(chat_id=conf[0], message_id=conf[1])
+                                            try:
+                                                self.logger.info(f"delrec:no: deleted stored confirm message {conf}")
+                                            except Exception:
+                                                pass
+                                        except Exception as ex:
+                                            try:
+                                                self.logger.debug(f"delrec:no: failed to delete stored confirm message {conf} -> {ex}")
+                                            except Exception:
+                                                pass
+                                            # fallback: попробуем убрать клавиатуру у сохранённого сообщения
+                                            try:
+                                                await context.bot.edit_message_reply_markup(chat_id=conf[0], message_id=conf[1], reply_markup=None)
+                                            except Exception:
+                                                pass
+                                    except Exception:
+                                        try:
+                                            self.logger.debug(f"delrec:no: failed to delete stored confirm message {conf}")
+                                        except Exception:
+                                            pass
+                            except Exception:
+                                pass
+                        except Exception:
+                            try:
+                                self.logger.exception('delrec: failed to delete confirmation message')
+                            except Exception:
+                                pass
+                        return
+                    # 'yes' — удалить запись из БД, удалить подтверждение и сообщение с деталями, показать список
+                    if action == 'yes' and member_id is not None:
+                        try:
+                            # архивируем и удалим запись через DelRecord helper
+                            try:
+                                from db.del_record import DelRecord
+                                del_record = DelRecord()
+                                fake = type('F', (), {})()
+                                fake.message = query.message
+                                archived_ok = await del_record.archive_and_delete_by_id(fake, context, member_id)
+                                if not archived_ok:
+                                    try:
+                                        self.logger.exception('delrec: archive_and_delete failed')
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                try:
+                                    self.logger.exception('delrec: failed to archive and delete member')
+                                except Exception:
+                                    pass
+                            # удалим подтверждение
+                            try:
+                                await query.message.delete()
+                                try:
+                                    self.logger.info(f"delrec:yes: deleted confirmation message for {member_id}")
+                                except Exception:
+                                    pass
+                            except Exception:
+                                pass
+                            # также удалить сохранённое сообщение подтверждения, если есть
+                            try:
+                                conf = context.user_data.pop('delrec_confirm_message', None)
+                                if conf and isinstance(conf, (list, tuple)) and len(conf) >= 2:
+                                    try:
+                                        await context.bot.delete_message(chat_id=conf[0], message_id=conf[1])
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
+                            # удалим сообщение с деталями, если сохранено
+                            details_msg = context.user_data.pop('workdb_member_details_message', None)
+                            try:
+                                if details_msg and isinstance(details_msg, (list, tuple)) and len(details_msg) >= 2:
+                                    await context.bot.delete_message(chat_id=details_msg[0], message_id=details_msg[1])
+                            except Exception:
+                                pass
+                            # Обновим/покажем список заново
+                            rows = context.user_data.get('workdb_sorted_rows', None)
+                            page = context.user_data.get('workdb_current_page', 1)
+                            if rows:
+                                # обновим локальный rows — удалим удалённую запись если present
+                                try:
+                                    rows = [r for r in rows if r[0] != member_id]
+                                    context.user_data['workdb_sorted_rows'] = rows
+                                except Exception:
+                                    pass
+                                fake = type('F', (), {})()
+                                fake.callback_query = query
+                                fake.message = query.message
+                                await self._send_user_list(fake, context, rows, page=page)
+                            else:
+                                # если нет сохранённых rows — просто вернём в админ-меню
+                                from bot import admin_message
+                                fake = type('F', (), {})()
+                                fake.callback_query = query
+                                fake.message = query.message
+                                await admin_message(fake, context)
+                        except Exception:
+                            try:
+                                self.logger.exception('delrec: failed during confirmation handling')
+                            except Exception:
+                                pass
+                        # сбросим состояния
+                        context.user_data.pop('member_details_id', None)
+                        context.user_data.pop('awaiting_member_details_action', None)
+                        return
+            except Exception:
+                try:
+                    self.logger.exception('handle_callback: unexpected error in delrec handling')
+                except Exception:
+                    pass
 
         # Обработка навигации по страницам и выхода
         if kind == 'list' and len(parts) >= 3:
@@ -402,6 +688,127 @@ class WorkDB:
                 except Exception:
                     pass
             return
+        # Обработка действий detail (Редактировать / Удалить / Выход) из клавиатуры деталей записи
+        if kind == 'detail' and len(parts) >= 3:
+            action = parts[2]
+            # Редактировать: перейти к меню редактирования для этой записи
+            if action == 'edit' and len(parts) >= 4:
+                try:
+                    try:
+                        details_msg = context.user_data.pop('workdb_member_details_message', None)
+                        actions_msg = context.user_data.pop('workdb_member_actions_message', None)
+                        for msg in (actions_msg, details_msg):
+                            if msg and isinstance(msg, (list, tuple)) and len(msg) >= 2:
+                                try:
+                                    await context.bot.delete_message(chat_id=msg[0], message_id=msg[1])
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+                    member_id = int(parts[3])
+                    from db.edit_db import EditDB
+                    edit_db = EditDB()
+                    fake = type('F', (), {})()
+                    fake.message = query.message
+                    await edit_db.edit_member_by_id(fake, context, member_id)
+                except Exception:
+                    try:
+                        self.logger.exception('handle_callback: failed to start edit flow from detail')
+                    except Exception:
+                        pass
+                # Сбросим состояние деталей
+                context.user_data.pop('member_details_id', None)
+                context.user_data.pop('awaiting_member_details_action', None)
+                return
+
+            # Удалить: перейти к подтверждению удаления для этой записи
+            if action == 'delete' and len(parts) >= 4:
+                try:
+                    # При нажатии 'Удалить запись' не удаляем сообщение с деталями — оно должно оставаться
+                    member_id = int(parts[3])
+                    from db.del_record import DelRecord
+                    del_record = DelRecord()
+                    fake = type('F', (), {})()
+                    fake.message = query.message
+                    await del_record.delete_member_by_id(fake, context, member_id)
+                except Exception:
+                    try:
+                        self.logger.exception('handle_callback: failed to start delete flow from detail')
+                    except Exception:
+                        pass
+                # Не сбрасываем состояния здесь — детали остаются видимыми до подтверждения удаления
+                return
+
+            # Назад: удалить сообщения с деталями и клавиатурой, вернуть в режим списка
+            if action == 'back':
+                try:
+                    details_msg = context.user_data.pop('workdb_member_details_message', None)
+                    actions_msg = context.user_data.pop('workdb_member_actions_message', None)
+                    for msg in (actions_msg, details_msg):
+                        if msg and isinstance(msg, (list, tuple)) and len(msg) >= 2:
+                            try:
+                                await context.bot.delete_message(chat_id=msg[0], message_id=msg[1])
+                            except Exception:
+                                pass
+                    # Попробуем убрать клавиатуру у исходного сообщения списка
+                    try:
+                        await query.message.edit_reply_markup(reply_markup=None)
+                    except Exception:
+                        pass
+                    # Попытаемся восстановить/показать список на той же странице
+                    rows = context.user_data.get('workdb_sorted_rows', [])
+                    page = context.user_data.get('workdb_current_page', 1)
+                    if rows:
+                        fake = type('F', (), {})()
+                        fake.callback_query = query
+                        fake.message = query.message
+                        await self._send_user_list(fake, context, rows, page=page)
+                    else:
+                        # Если данных нет, вернём пользователя в главное админ-меню
+                        from bot import admin_message
+                        fake = type('F', (), {})()
+                        fake.callback_query = query
+                        fake.message = query.message
+                        await admin_message(fake, context)
+                except Exception:
+                    try:
+                        self.logger.exception('handle_callback: failed to return to list from detail back')
+                    except Exception:
+                        pass
+                # Сбросим состояние
+                context.user_data.pop('member_details_id', None)
+                context.user_data.pop('awaiting_member_details_action', None)
+                return
+            # Выход из просмотра деталей: удалить сообщения с деталями и клавиатурой, вернуться в админ-меню
+            if action == 'exit':
+                try:
+                    details_msg = context.user_data.pop('workdb_member_details_message', None)
+                    actions_msg = context.user_data.pop('workdb_member_actions_message', None)
+                    for msg in (actions_msg, details_msg):
+                        if msg and isinstance(msg, (list, tuple)) and len(msg) >= 2:
+                            try:
+                                await context.bot.delete_message(chat_id=msg[0], message_id=msg[1])
+                            except Exception:
+                                pass
+                    # также попробуем убрать клавиатуру у исходного сообщения списка
+                    try:
+                        await query.message.edit_reply_markup(reply_markup=None)
+                    except Exception:
+                        pass
+                    from bot import admin_message
+                    fake = type('F', (), {})()
+                    fake.callback_query = query
+                    fake.message = query.message
+                    await admin_message(fake, context)
+                except Exception:
+                    try:
+                        self.logger.exception('handle_callback: failed to return to admin menu from detail exit')
+                    except Exception:
+                        pass
+                # Сбросим состояние
+                context.user_data.pop('member_details_id', None)
+                context.user_data.pop('awaiting_member_details_action', None)
+                return
     FIELD_MAP = {  # Сопоставление полей базы данных с пользовательскими названиями
         'surname': 'Фамилия',
         'name': 'Имя',
@@ -435,10 +842,55 @@ class WorkDB:
                 result = cursor.fetchone()
                 if result:
                     details = '\n'.join(f"{self.FIELD_MAP.get(field, field)}: {value}" for field, value in zip(select_fields, result))
-                    await update.message.reply_text(f'Данные выбранной записи:\n{details}')
-                    await update.message.reply_text(
-                        'Выберите действие для этой записи:\n1. Редактировать данные\n2. Удалить запись\n0. Выйти'
-                    )
+                    # Перед показом деталей удалим сообщения списка (entries/pages), чтобы не оставлять старый список в чате
+                    try:
+                        prev_entries = context.user_data.pop('workdb_entries_message', None)
+                        prev_pages = context.user_data.pop('workdb_pages_message', None)
+                        for msg in (prev_entries, prev_pages):
+                            if msg and isinstance(msg, (list, tuple)) and len(msg) >= 2:
+                                try:
+                                    await context.bot.delete_message(chat_id=msg[0], message_id=msg[1])
+                                except Exception:
+                                    pass
+                    except Exception:
+                        try:
+                            self.logger.exception('show_member_details: failed to cleanup list messages')
+                        except Exception:
+                            pass
+
+                    # Отправим текст с деталями и сохраним его id, чтобы можно было удалить при выходе
+                    try:
+                        sent_details = await update.message.reply_text(f'Данные выбранной записи:\n{details}')
+                        try:
+                            context.user_data['workdb_member_details_message'] = (sent_details.chat.id, sent_details.message_id)
+                        except Exception:
+                            pass
+                    except Exception:
+                        # Если отправка не удалась — постим без сохранения
+                        await update.message.reply_text(f'Данные выбранной записи:\n{details}')
+
+                    # Вместо текстового списка — отправим Inline-кнопки: Редактировать, Удалить, Выход
+                    try:
+                        from telegram import InlineKeyboardMarkup, InlineKeyboardButton
+                        kb = InlineKeyboardMarkup([
+                            [InlineKeyboardButton('Редактировать данные', callback_data=f'workdb:detail:edit:{member_id}')],
+                            [InlineKeyboardButton('Удалить запись', callback_data=f'workdb:detail:delete:{member_id}')],
+                            [
+                                InlineKeyboardButton('Назад', callback_data=f'workdb:detail:back:{member_id}'),
+                                InlineKeyboardButton('Выход', callback_data=f'workdb:detail:exit')
+                            ]
+                        ])
+                        sent_kb = await update.message.reply_text('Выберите действие для этой записи:', reply_markup=kb)
+                        # Сохраним сообщение клавиатуры на случай, если потребуется очистка
+                        try:
+                            context.user_data['workdb_member_actions_message'] = (sent_kb.chat.id, sent_kb.message_id)
+                        except Exception:
+                            pass
+                    except Exception:
+                        # fallback к старому текстовому варианту
+                        await update.message.reply_text(
+                            'Выберите действие для этой записи:\n1. Редактировать данные\n2. Удалить запись\n0. Выйти'
+                        )
                     # Сохраняем id выбранной записи и ожидаем ввод действия
                     context.user_data['member_details_id'] = member_id
                     context.user_data['awaiting_member_details_action'] = True

@@ -655,10 +655,12 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'(?i)фото'), photo_message))
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'(?i)видео'), video_message))
     # Цифровой ряд больше не используется — обработчики удалены
-    # workdb callbacks (list pages, member selection, exit)
+    # workdb callbacks (list pages, member selection, exit) and related callbacks
     from db.work_db import WorkDB
     workdb = WorkDB()
-    application.add_handler(CallbackQueryHandler(workdb.handle_callback, pattern=r'^workdb:'))
+    # Подпишем один обработчик на префиксы workdb:, delrec: и editdb:, чтобы все соответствующие callback'ы
+    # доставлялись в WorkDB.handle_callback для централизованной маршрутизации.
+    application.add_handler(CallbackQueryHandler(workdb.handle_callback, pattern=r'^(workdb:|delrec:|editdb:)'))
 
     logging.info("Бот стартовал")
 

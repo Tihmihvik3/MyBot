@@ -77,30 +77,57 @@ class EditDB:
         await self.show_edit_menu(update, context)
         context.user_data['editdb_awaiting_choice'] = False
 
+    async def edit_member_by_id(self, update, context, member_id):
+        """
+        Начать редактирование конкретной записи по id (вызывается из callback'а).
+        Устанавливает выбранный rowid в context и показывает меню выбора поля.
+        """
+        # Сохраним выбранный rowid в состоянии модуля
+        try:
+            context.user_data['editdb_selected_rowid'] = member_id
+        except Exception:
+            pass
+        # Сразу показать меню редактирования (оно использует send_and_track)
+        await self.show_edit_menu(update, context)
+
     async def show_edit_menu(self, update, context):
-        # Показать меню редактирования
-        # Перед показом меню удалим старые сообщения через send_and_track
-        try:
-            await send_and_track(context, update.message, 'Выберите поле для редактирования:')
-        except Exception:
-            logger.exception('show_edit_menu: send_and_track failed; falling back')
-            menu = 'Выберите поле для редактирования:\n'
-        else:
-            # send_and_track уже отправил приглашение, но всё равно сформируем меню для state
-            menu = ''
-        if not menu:
-            # сформируем меню ниже
-            menu = 'Выберите поле для редактирования:\n'
+        # Показать меню редактирования как Inline-клавиатуру (callback-driven)
+        selected_rowid = context.user_data.get('editdb_selected_rowid')
+        if not selected_rowid:
+            try:
+                await send_and_track(context, update.message, 'Ошибка: не выбран идентификатор записи для редактирования.')
+            except Exception:
+                await update.message.reply_text('Ошибка: не выбран идентификатор записи для редактирования.')
+            return
+
+        from telegram import InlineKeyboardMarkup, InlineKeyboardButton
+        buttons = []
         for idx, col in enumerate(self.fields, 1):
-            menu += f"{idx}. {col}\n"
-        menu += 'Введите номер поля:'
-        # Если send_and_track уже отправил приглашение — повторно отправлять не нужно;
-        # однако, чтобы сохранить совместимость, отправим меню если оно не было отправлено выше
+            cb = f'editdb:field:{idx}:{selected_rowid}'
+            buttons.append([InlineKeyboardButton(f'{idx}. {col}', callback_data=cb)])
+        # Добавим кнопку отмены
+        buttons.append([InlineKeyboardButton('Отмена', callback_data='editdb:cancel')])
+        kb = InlineKeyboardMarkup(buttons)
+
+        # Удалим старые admin сообщения и отправим клавиатуру
         try:
-            await send_and_track(context, update.message, menu)
+            if getattr(update, 'message', None):
+                sent = await update.message.reply_text('Выберите поле для редактирования:', reply_markup=kb)
+            else:
+                user = getattr(update, 'effective_user', None)
+                chat_id = user.id if user and getattr(user, 'id', None) else (getattr(update.callback_query.from_user, 'id', None) if getattr(update, 'callback_query', None) else None)
+                if chat_id:
+                    sent = await context.bot.send_message(chat_id=chat_id, text='Выберите поле для редактирования:', reply_markup=kb)
+                else:
+                    raise RuntimeError('No chat_id to send edit menu')
+            try:
+                context.user_data['editdb_menu_message'] = (sent.chat.id, sent.message_id)
+            except Exception:
+                pass
         except Exception:
-            await update.message.reply_text(menu)
-        context.user_data['editdb_awaiting_field'] = True
+            logger.exception('show_edit_menu: failed to send edit menu')
+        # меню теперь ожидает callback'а, не текст
+        context.user_data.pop('editdb_awaiting_field', None)
 
     async def handle_field_edit(self, update, context):
         # Обработка выбора поля для редактирования
@@ -180,6 +207,91 @@ class EditDB:
         except Exception as e:
             await update.message.reply_text(f'Ошибка при сохранении: {e}')
         context.user_data['editdb_awaiting_new_value'] = None
+
+    async def process_field_callback(self, update, context):
+        """
+        Обработка нажатия на поле в Inline-клавиатуре выбора поля.
+        Устанавливает состояние ожидания нового значения и просит ввести текст.
+        Callback data: editdb:field:<idx>:<rowid>
+        """
+        query = update.callback_query
+        data = getattr(query, 'data', '') or ''
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        parts = data.split(':')
+        if len(parts) < 4:
+            try:
+                await query.message.reply_text('Некорректные данные callback.')
+            except Exception:
+                pass
+            return
+        try:
+            idx = int(parts[2])
+            rowid = int(parts[3])
+        except Exception:
+            try:
+                await query.message.reply_text('Некорректный идентификатор поля или записи.')
+            except Exception:
+                pass
+            return
+        if idx < 1 or idx > len(self.fields):
+            try:
+                await query.message.reply_text('Некорректный номер поля.')
+            except Exception:
+                pass
+            return
+        field_name = self.fields[idx-1]
+        db_field = self.db_fields[idx-1]
+
+        # Удалим меню выбора поля
+        try:
+            menu_msg = context.user_data.pop('editdb_menu_message', None)
+            if menu_msg and isinstance(menu_msg, (list, tuple)) and len(menu_msg) >= 2:
+                try:
+                    await context.bot.delete_message(chat_id=menu_msg[0], message_id=menu_msg[1])
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Сохраняем ожидание нового значения
+        context.user_data['editdb_awaiting_new_value'] = {'field': db_field, 'rowid': rowid, 'field_name': field_name}
+
+        # Попросим ввести новое значение (текстовое). Это единственная текстовая точка ввода.
+        try:
+            await query.message.reply_text(f'Введите новое значение для поля "{field_name}":')
+        except Exception:
+            try:
+                user_id = getattr(query.from_user, 'id', None)
+                if user_id:
+                    await context.bot.send_message(chat_id=user_id, text=f'Введите новое значение для поля "{field_name}":')
+            except Exception:
+                pass
+        # Флаг, что ожидаем текстовый ввод
+        context.user_data['editdb_waiting_text'] = True
+
+    async def handle_cancel_callback(self, update, context):
+        query = update.callback_query
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        # Удалим меню
+        try:
+            menu_msg = context.user_data.pop('editdb_menu_message', None)
+            if menu_msg and isinstance(menu_msg, (list, tuple)) and len(menu_msg) >= 2:
+                try:
+                    await context.bot.delete_message(chat_id=menu_msg[0], message_id=menu_msg[1])
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            await query.message.reply_text('Редактирование отменено.')
+        except Exception:
+            pass
 
     async def handle_continue_or_exit(self, update, context):
         text = update.message.text.strip()

@@ -117,6 +117,16 @@ class DelRecord:
                 await update.message.reply_text(f'Ошибка при удалении: {e}')
                 context.user_data['delrecord_repeat_or_exit'] = True
         elif text == '2':
+            # При отказе удалить — уберём сообщение с подтверждением удаления, если оно есть
+            try:
+                conf = context.user_data.pop('delrec_confirm_message', None)
+                if conf and isinstance(conf, (list, tuple)) and len(conf) >= 2:
+                    try:
+                        await context.bot.delete_message(chat_id=conf[0], message_id=conf[1])
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             try:
                 await send_and_track(context, update.message, '1. Повторить поиск\n2. Выход')
             except Exception:
@@ -144,6 +154,121 @@ class DelRecord:
         else:
             await update.message.reply_text('Введите 1 (повторить) или 2 (выход).')
 
+    async def delete_member_by_id(self, update, context, member_id):
+        """
+        Начать удаление записи по id (вызов из callback'а).
+        Сохранит выбранный rowid и предложит подтвердить удаление.
+        """
+        try:
+            context.user_data['delrecord_selected_rowid'] = member_id
+        except Exception:
+            pass
+        # Получим данные записи для показа пользователю
+        from db.database import Database
+        db = Database()
+        try:
+            with db.get_cursor() as cursor:
+                cursor.execute('SELECT id, surname, name, patronymic FROM members WHERE id = ?', (member_id,))
+                r = cursor.fetchone()
+                if not r:
+                    try:
+                        await send_and_track(context, update.message, 'Запись не найдена для удаления.')
+                    except Exception:
+                        await update.message.reply_text('Запись не найдена для удаления.')
+                    return
+
+                # Формируем компактный текст: только значения полей (без названий)
+                surname = r[1] if len(r) > 1 and r[1] is not None else ''
+                name = r[2] if len(r) > 2 and r[2] is not None else ''
+                patronymic = r[3] if len(r) > 3 and r[3] is not None else ''
+                record_text = ' '.join(part for part in (surname, name, patronymic) if part)
+
+                # Inline-подтверждение: Да / Нет
+                from telegram import InlineKeyboardMarkup, InlineKeyboardButton
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton('Да', callback_data=f'delrec:yes:{member_id}'), InlineKeyboardButton('Нет', callback_data=f'delrec:no:{member_id}')]
+                ])
+                try:
+                    sent = await update.message.reply_text(f'Запись:\n{record_text}\nУдалить?', reply_markup=kb)
+                    try:
+                        context.user_data['delrec_confirm_message'] = (sent.chat.id, sent.message_id)
+                        try:
+                            logger.info(f"delete_member_by_id: sent confirm message and saved delrec_confirm_message={(sent.chat.id, sent.message_id)} for member_id={member_id}")
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+                except Exception:
+                    # fallback
+                    try:
+                        await send_and_track(context, update.message, f'Запись:\n{record_text}\nУдалить?\n1. Да 2. Нет')
+                    except Exception:
+                        await update.message.reply_text(f'Запись:\n{record_text}\nУдалить?\n1. Да 2. Нет')
+                    context.user_data['delrecord_awaiting_confirm'] = True
+        except Exception as e:
+            await update.message.reply_text(f'Ошибка при подготовке удаления: {e}')
+
+    async def archive_and_delete_by_id(self, update, context, member_id):
+        """
+        Архивировать запись в members_archive и удалить из members.
+        Возвращает True при успехе, False при ошибке.
+        """
+        from db.database import Database
+        db = Database()
+        try:
+            with db.get_cursor() as cursor:
+                # Получим структуру таблицы members
+                cursor.execute('PRAGMA table_info(members)')
+                cols_info = cursor.fetchall()
+                cols = [c[1] for c in cols_info]
+                # Выберем все значения для этой записи
+                sel_fields = ', '.join([f'"{c}"' for c in cols]) if cols else '*'
+                cursor.execute(f'SELECT {sel_fields} FROM members WHERE id = ?', (member_id,))
+                row = cursor.fetchone()
+                if not row:
+                    return False
+
+                # Список полей для архива (кроме archive_id и archived_at)
+                archive_fields = [
+                    'original_rowid', 'surname', 'name', 'patronymic', 'date_birth', 'group_disability', 'phone', 'address', 'area', 'group', 'help_number', 'date_issue', 'validity_period', 'pension_number', 'ticket_number', 'date_entry', 'floor'
+                ]
+
+                # Соберём значения в том порядке, который ожидает members_archive
+                values = [member_id]
+                for af in archive_fields[1:]:
+                    # В schema archive field name for "group" is "group" but in PRAGMA it may be group or `group`
+                    colname = af
+                    # special-case group field name
+                    if af == 'group':
+                        # try both group and `group`
+                        candidates = ['group', '"group"', '`group`']
+                    else:
+                        candidates = [colname]
+                    val = None
+                    for cand in candidates:
+                        if cand in cols:
+                            idx = cols.index(cand)
+                            val = row[idx]
+                            break
+                    values.append(val)
+
+                # Выполним вставку в members_archive
+                placeholders = ', '.join(['?'] * len(values))
+                fields_sql = ', '.join(['original_rowid', 'surname', 'name', 'patronymic', 'date_birth', 'group_disability', 'phone', 'address', 'area', '"group"', 'help_number', 'date_issue', 'validity_period', 'pension_number', 'ticket_number', 'date_entry', 'floor'])
+                try:
+                    cursor.execute(f'INSERT INTO members_archive ({fields_sql}) VALUES ({placeholders})', tuple(values))
+                except Exception:
+                    # Если не удалось архивировать — отменяем удаление
+                    return False
+
+                # Удалим запись из members
+                try:
+                    cursor.execute('DELETE FROM members WHERE id = ?', (member_id,))
+                except Exception:
+                    return False
+        except Exception:
+            return False
+        return True
     async def process_state(self, update, context):
         """
         Универсальный обработчик состояния для DelRecord.

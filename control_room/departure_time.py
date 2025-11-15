@@ -81,10 +81,22 @@ async def show_picker(cr, update, context):
     if row:
         kb.append(row)
     # Навигация/отмена
-    kb.append([InlineKeyboardButton('◀️ Назад', callback_data='control:back'), InlineKeyboardButton('❌ Отмена', callback_data='control:refresh')])
+    # Если мы вызваны из потока создания заявки, используем локальную кнопку Back
+    back_cb = 'control:create:prev' if context.user_data.get('control_room_create_in_progress') else 'control:back'
+    kb.append([InlineKeyboardButton(messages.BTN_BACK, callback_data=back_cb), InlineKeyboardButton(messages.BTN_CANCEL, callback_data='control:refresh')])
     markup = InlineKeyboardMarkup(kb)
     try:
         # Попытаемся аккуратно отредактировать текущее сообщение
+        # Если находимся в потоке создания — зафиксируем шаг creation как departure_time,
+        # чтобы при нажатии локальной кнопки 'control:create:prev' корректно перейти на предыдущий шаг.
+        if context.user_data.get('control_room_create_in_progress'):
+            try:
+                for i, f in enumerate(cr.fields):
+                    if f[0] == 'departure_time':
+                        context.user_data['control_room_create_step'] = i
+                        break
+            except Exception:
+                pass
         await cr._safe_edit_query(query, context, messages.DEPARTURE_TIME_PROMPT, reply_markup=markup)
     except Exception:
         # fallback — отправим новое tracked-сообщение
@@ -136,6 +148,6 @@ async def handle_pick(cr, update, context, time_str: str):
         except Exception:
             pass
         try:
-            await cr._send_and_track(context, query.message, f'Ошибка при установке времени: {time_str}')
+            await cr._send_and_track(context, query.message, messages.ERROR_SET_TIME.format(time=time_str))
         except Exception:
             pass
