@@ -1,6 +1,8 @@
 from bot import admin_message
+import messages_admin as MESSAGES_ADMIN
 import logging
 from db.database import Database
+from utils.member_formatter import get_member_details_text
 from db.edit_db import EditDB
 from db.add_record import AddRecord
 from db.del_record import DelRecord
@@ -38,7 +40,7 @@ class WorkDB:
         if action:
             await action(update, context)
         else:
-            await update.message.reply_text("Некорректный выбор. Введите номер действия от 1 до 5.")
+            await update.message.reply_text(MESSAGES_ADMIN.WORKDB_INVALID_CHOICE)
 
     async def _handle_member_detail_choice(self, update, context, text):
         """
@@ -46,27 +48,27 @@ class WorkDB:
         """
         context.user_data['awaiting_member_detail_choice'] = False
         if text == '0':
-            await update.message.reply_text('Выход в меню администратора.')
+            await update.message.reply_text(MESSAGES_ADMIN.ADMIN_EXIT_TO_MENU)
             
             await admin_message(update, context)
             return
         try:
             idx = int(text)
         except Exception:
-            await update.message.reply_text('Некорректный номер. Попробуйте снова.')
+            await update.message.reply_text(MESSAGES_ADMIN.INVALID_NUMBER_TRY_AGAIN)
             return
         members_list = context.user_data.get('sorted_members_list', [])
         if 1 <= idx <= len(members_list):
             member_id = members_list[idx - 1]
             await self.show_member_details(update, context, member_id)
         else:
-            await update.message.reply_text('Некорректный номер. Попробуйте снова.')
+                await update.message.reply_text(MESSAGES_ADMIN.INVALID_NUMBER_TRY_AGAIN)
 
     async def _handle_search_surname(self, update, context):
         """
         Запрашивает у администратора фамилию для поиска пользователя.
         """
-        await update.message.reply_text("Введите фамилию для поиска:")
+        await update.message.reply_text(MESSAGES_ADMIN.SEARCH_ENTER_SURNAME)
         context.user_data['awaiting_surname'] = True
 
     async def _handle_edit_surname(self, update, context):
@@ -108,15 +110,19 @@ class WorkDB:
                 pass
             # Попытка аккуратно уведомить пользователя
             try:
+                text = MESSAGES_ADMIN.ERROR_SORTING.format(error=e)
                 if getattr(update, 'message', None):
-                    await update.message.reply_text(f'Ошибка при сортировке: {e}')
+                    await update.message.reply_text(text)
                 else:
                     chat_id = getattr(update, 'effective_user', None)
                     cid = chat_id.id if chat_id else getattr(update.callback_query.from_user, 'id', None)
                     if cid:
-                        await context.bot.send_message(chat_id=cid, text=f'Ошибка при сортировке: {e}')
+                        await context.bot.send_message(chat_id=cid, text=text)
             except Exception:
-                self.logger.exception('Не удалось уведомить пользователя об ошибке сортировки')
+                try:
+                    self.logger.exception('Не удалось уведомить пользователя об ошибке сортировки')
+                except Exception:
+                    pass
 
     async def _send_user_list(self, update, context, rows, page: int = 1):
         """
@@ -143,7 +149,7 @@ class WorkDB:
                 page = total_pages
             context.user_data['workdb_current_page'] = page
 
-            header = f'Список пользователей (отсортировано по фамилии):\nСтраница {page} из {total_pages}'
+            header = MESSAGES_ADMIN.USER_LIST_HEADER + "\n" + MESSAGES_ADMIN.PAGE_INFO.format(page=page, total_pages=total_pages)
             # Отправим заголовок с клавиатурой для первой страницы
             # Перед отправкой удалим ранее отправленные сообщения списка (entries/pages), чтобы не мусорить чат
             # Если вызов пришёл из CallbackQuery (нажатие inline-кнопки администратора),
@@ -206,7 +212,7 @@ class WorkDB:
                 # Отправляем два сообщения: 1) заголовок + клавиатура записей, 2) текст с номером страницы + клавиатура страниц
                 if getattr(update, 'message', None):
                     sent_entries = await update.message.reply_text(header, reply_markup=kb_entries)
-                    sent_pages = await update.message.reply_text(f'Страница {page} из {total_pages}', reply_markup=kb_pages)
+                    sent_pages = await update.message.reply_text(MESSAGES_ADMIN.PAGE_INFO.format(page=page, total_pages=total_pages), reply_markup=kb_pages)
                 else:
                     # fallback: отправим через bot.send_message
                     user = getattr(update, 'effective_user', None)
@@ -217,7 +223,7 @@ class WorkDB:
                         chat_id = update.callback_query.from_user.id
                     if chat_id:
                         sent_entries = await context.bot.send_message(chat_id=chat_id, text=header, reply_markup=kb_entries)
-                        sent_pages = await context.bot.send_message(chat_id=chat_id, text=f'Страница {page} из {total_pages}', reply_markup=kb_pages)
+                        sent_pages = await context.bot.send_message(chat_id=chat_id, text=MESSAGES_ADMIN.PAGE_INFO.format(page=page, total_pages=total_pages), reply_markup=kb_pages)
                     else:
                         raise RuntimeError('No chat_id available for sending user list')
                 # Сохраним id сообщений, чтобы в callback'е можно было редактировать клавиатуры и текст
@@ -235,12 +241,12 @@ class WorkDB:
         else:
             try:
                 if getattr(update, 'message', None):
-                    await update.message.reply_text('В базе нет данных.')
+                    await update.message.reply_text(MESSAGES_ADMIN.DB_EMPTY)
                 else:
                     chat_id = getattr(update, 'effective_user', None)
                     cid = chat_id.id if chat_id else (getattr(update.callback_query.from_user, 'id', None) if getattr(update, 'callback_query', None) else None)
                     if cid:
-                        await context.bot.send_message(chat_id=cid, text='В базе нет данных.')
+                        await context.bot.send_message(chat_id=cid, text=MESSAGES_ADMIN.DB_EMPTY)
             except Exception:
                 try:
                     self.logger.exception('_send_user_list: failed to report empty DB')
@@ -289,7 +295,7 @@ class WorkDB:
         if row:
             buttons.append(row)
         # Добавим отдельную строку с кнопкой выхода
-        buttons.append([InlineKeyboardButton('Выход', callback_data='workdb:list:exit')])
+        buttons.append([InlineKeyboardButton(MESSAGES_ADMIN.BTN_EXIT, callback_data='workdb:list:exit')])
         return InlineKeyboardMarkup(buttons)
 
     async def handle_callback(self, update, context):
@@ -316,8 +322,13 @@ class WorkDB:
             try:
                 from db.edit_db import EditDB
                 edit_db = EditDB()
-                # Передаём полный update (callback_query) в метод обработки
-                await edit_db.process_field_callback(update, context) if data.startswith('editdb:field:') else await edit_db.handle_cancel_callback(update, context)
+                # Route editdb callbacks: field selection, input controls, or cancel
+                if data.startswith('editdb:field:'):
+                    await edit_db.process_field_callback(update, context)
+                elif data.startswith('editdb:input:'):
+                    await edit_db.handle_input_callback(update, context)
+                else:
+                    await edit_db.handle_cancel_callback(update, context)
             except Exception:
                 try:
                     self.logger.exception('handle_callback: failed to delegate editdb callback')
@@ -623,7 +634,7 @@ class WorkDB:
                         except Exception:
                             pass
                     # Обновим сообщение с номером страницы (текст и клавиатура)
-                    header = f'Страница {page} из {total_pages}'
+                    header = MESSAGES_ADMIN.PAGE_INFO.format(page=page, total_pages=total_pages)
                     if pages_msg:
                         await context.bot.edit_message_text(chat_id=pages_msg[0], message_id=pages_msg[1], text=header, reply_markup=new_kb_pages)
                     else:
@@ -674,7 +685,7 @@ class WorkDB:
                 member_id = int(parts[2])
             except Exception:
                 try:
-                    await query.message.reply_text('Некорректный идентификатор записи.')
+                    await query.message.reply_text(MESSAGES_ADMIN.INVALID_RECORD_ID)
                 except Exception:
                     pass
                 return
@@ -841,7 +852,8 @@ class WorkDB:
                 cursor.execute(f"SELECT {fields_sql} FROM members WHERE id = ?", (member_id,))
                 result = cursor.fetchone()
                 if result:
-                    details = '\n'.join(f"{self.FIELD_MAP.get(field, field)}: {value}" for field, value in zip(select_fields, result))
+                    # Получим форматированные детали через helper
+                    details = get_member_details_text(member_id, db_instance=self.db)
                     # Перед показом деталей удалим сообщения списка (entries/pages), чтобы не оставлять старый список в чате
                     try:
                         prev_entries = context.user_data.pop('workdb_entries_message', None)
@@ -860,27 +872,27 @@ class WorkDB:
 
                     # Отправим текст с деталями и сохраним его id, чтобы можно было удалить при выходе
                     try:
-                        sent_details = await update.message.reply_text(f'Данные выбранной записи:\n{details}')
+                        sent_details = await update.message.reply_text(MESSAGES_ADMIN.MEMBER_DETAILS_HEADER + f"\n{details}")
                         try:
                             context.user_data['workdb_member_details_message'] = (sent_details.chat.id, sent_details.message_id)
                         except Exception:
                             pass
                     except Exception:
                         # Если отправка не удалась — постим без сохранения
-                        await update.message.reply_text(f'Данные выбранной записи:\n{details}')
+                        await update.message.reply_text(MESSAGES_ADMIN.MEMBER_DETAILS_HEADER + f"\n{details}")
 
                     # Вместо текстового списка — отправим Inline-кнопки: Редактировать, Удалить, Выход
                     try:
                         from telegram import InlineKeyboardMarkup, InlineKeyboardButton
                         kb = InlineKeyboardMarkup([
-                            [InlineKeyboardButton('Редактировать данные', callback_data=f'workdb:detail:edit:{member_id}')],
-                            [InlineKeyboardButton('Удалить запись', callback_data=f'workdb:detail:delete:{member_id}')],
+                            [InlineKeyboardButton(MESSAGES_ADMIN.BTN_EDIT, callback_data=f'workdb:detail:edit:{member_id}')],
+                            [InlineKeyboardButton(MESSAGES_ADMIN.BTN_DELETE, callback_data=f'workdb:detail:delete:{member_id}')],
                             [
-                                InlineKeyboardButton('Назад', callback_data=f'workdb:detail:back:{member_id}'),
-                                InlineKeyboardButton('Выход', callback_data=f'workdb:detail:exit')
+                                InlineKeyboardButton(MESSAGES_ADMIN.BTN_BACK, callback_data=f'workdb:detail:back:{member_id}'),
+                                InlineKeyboardButton(MESSAGES_ADMIN.BTN_EXIT, callback_data=f'workdb:detail:exit')
                             ]
                         ])
-                        sent_kb = await update.message.reply_text('Выберите действие для этой записи:', reply_markup=kb)
+                        sent_kb = await update.message.reply_text(MESSAGES_ADMIN.MEMBER_DETAILS_ACTION_PROMPT, reply_markup=kb)
                         # Сохраним сообщение клавиатуры на случай, если потребуется очистка
                         try:
                             context.user_data['workdb_member_actions_message'] = (sent_kb.chat.id, sent_kb.message_id)
@@ -888,16 +900,14 @@ class WorkDB:
                             pass
                     except Exception:
                         # fallback к старому текстовому варианту
-                        await update.message.reply_text(
-                            'Выберите действие для этой записи:\n1. Редактировать данные\n2. Удалить запись\n0. Выйти'
-                        )
+                        await update.message.reply_text(MESSAGES_ADMIN.MEMBER_DETAILS_ACTION_FALLBACK)
                     # Сохраняем id выбранной записи и ожидаем ввод действия
                     context.user_data['member_details_id'] = member_id
                     context.user_data['awaiting_member_details_action'] = True
                 else:
-                    await update.message.reply_text('Запись не найдена.')
+                    await update.message.reply_text(MESSAGES_ADMIN.RECORD_NOT_FOUND_SIMPLE)
         except Exception as e:
-            await update.message.reply_text(f'Ошибка при выборе записи: {e}')
+            await update.message.reply_text(MESSAGES_ADMIN.ERROR_SELECT.format(error=e))
     async def handle_member_details_action(self, update, context):
         """
         Обрабатывает выбор действия над записью: редактировать, удалить, выйти.
@@ -919,7 +929,7 @@ class WorkDB:
             await del_record.delete_member_by_id(update, context, member_id)
             return
         else:
-            await update.message.reply_text('Некорректный выбор. Введите 1, 2 или 0.')
+            await update.message.reply_text(MESSAGES_ADMIN.MEMBER_DETAILS_INVALID_CHOICE)
             context.user_data['awaiting_member_details_action'] = True
 
     async def search_by_second_field(self, update, context):
@@ -932,7 +942,7 @@ class WorkDB:
                 cursor.execute('SELECT * FROM members WHERE LOWER(surname) LIKE LOWER(?) LIMIT 30', (surname + '%',))
                 rows = cursor.fetchall()
                 if rows:
-                    msg = 'Результаты поиска:\n'
+                    msg = MESSAGES_ADMIN.SEARCH_RESULTS_HEADER + '\n'
                     messages = []
                     for idx, row in enumerate(rows, 1):
                         line = f"{idx} | " + ' | '.join(str(field) for field in row[1:]) + '\n'
@@ -945,7 +955,7 @@ class WorkDB:
                     for m in messages:
                         await update.message.reply_text(m)
                 else:
-                    await update.message.reply_text('Совпадений не найдено.')
+                    await update.message.reply_text(MESSAGES_ADMIN.SEARCH_NO_MATCH_SIMPLE)
         except Exception as e:
-            await update.message.reply_text(f'Ошибка при поиске: {e}')
+            await update.message.reply_text(MESSAGES_ADMIN.ERROR_SEARCH.format(error=e))
     # Здесь будут методы для работы с базой данных (позже)

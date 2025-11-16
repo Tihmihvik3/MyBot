@@ -1,5 +1,6 @@
 import logging
 from utils.admin_messenger import send_and_track, delete_tracked_messages
+import messages_admin as MESSAGES_ADMIN
 
 logger = logging.getLogger(__name__)
 
@@ -12,10 +13,10 @@ class DelRecord:
     async def start_delete(self, update, context):
         # Удалим предыдущие админские сообщения перед началом удаления
         try:
-            await send_and_track(context, update.message, 'Введите фамилию для поиска (для удаления):')
+            await send_and_track(context, update.message, MESSAGES_ADMIN.SEARCH_ENTER_SURNAME)
         except Exception:
             logger.exception('start_delete: send_and_track failed; falling back')
-            await update.message.reply_text('Введите фамилию для поиска (для удаления):')
+            await update.message.reply_text(MESSAGES_ADMIN.SEARCH_ENTER_SURNAME)
         context.user_data['delrecord_awaiting_surname'] = True
 
     async def handle_surname_search(self, update, context):
@@ -28,9 +29,9 @@ class DelRecord:
                 rows = cursor.fetchall()
                 if not rows:
                     try:
-                        await send_and_track(context, update.message, 'Совпадений не найдено. Повторить поиск? 1. Да 2. Выход')
+                        await send_and_track(context, update.message, MESSAGES_ADMIN.SEARCH_NO_MATCH_RETRY)
                     except Exception:
-                        await update.message.reply_text('Совпадений не найдено. Повторить поиск? 1. Да 2. Выход')
+                        await update.message.reply_text(MESSAGES_ADMIN.SEARCH_NO_MATCH_RETRY)
                     context.user_data['delrecord_repeat_or_exit'] = True
                     context.user_data['delrecord_awaiting_surname'] = False
                     return
@@ -39,15 +40,15 @@ class DelRecord:
                     row = rows[0]
                     context.user_data['delrecord_selected_rowid'] = row[0]
                     try:
-                        await send_and_track(context, update.message, f"Найдена запись: Фамилия: {row[1]} | Имя: {row[2]} | Отчество: {row[3]}. Удалить? 1. Да 2. Нет")
+                        await send_and_track(context, update.message, f"Найдена запись: Фамилия: {row[1]} | Имя: {row[2]} | Отчество: {row[3]}. " + MESSAGES_ADMIN.CONFIRM_YES_NO)
                     except Exception:
-                        await update.message.reply_text(f"Найдена запись: Фамилия: {row[1]} | Имя: {row[2]} | Отчество: {row[3]}. Удалить? 1. Да 2. Нет")
+                        await update.message.reply_text(f"Найдена запись: Фамилия: {row[1]} | Имя: {row[2]} | Отчество: {row[3]}. " + MESSAGES_ADMIN.CONFIRM_YES_NO)
                     context.user_data['delrecord_awaiting_confirm'] = True
                 else:
                     msg = 'Результаты поиска:\n'
                     for idx, row in enumerate(rows, 1):
                         msg += f"{idx}. Фамилия: {row[1]} | Имя: {row[2]} | Отчество: {row[3]}\n"
-                    msg += 'Введите номер нужной записи:'
+                    msg += MESSAGES_ADMIN.SEARCH_RESULTS_PROMPT
                     try:
                         await send_and_track(context, update.message, msg)
                     except Exception:
@@ -60,19 +61,19 @@ class DelRecord:
     async def handle_choose_result(self, update, context):
         text = update.message.text.strip()
         if not text.isdigit():
-            await update.message.reply_text('Введите номер из списка!')
+            await update.message.reply_text(MESSAGES_ADMIN.ENTER_NUMBER_FROM_LIST)
             return
         idx = int(text)
         results = context.user_data.get('delrecord_search_results', [])
         if idx < 1 or idx > len(results):
-            await update.message.reply_text('Некорректный номер!')
+            await update.message.reply_text(MESSAGES_ADMIN.INVALID_NUMBER)
             return
         row = results[idx-1]
         context.user_data['delrecord_selected_rowid'] = row[0]
         try:
-            await send_and_track(context, update.message, f"Вы выбрали: Фамилия: {row[1]} | Имя: {row[2]} | Отчество: {row[3]}. Удалить? 1. Да 2. Нет")
+            await send_and_track(context, update.message, f"Вы выбрали: Фамилия: {row[1]} | Имя: {row[2]} | Отчество: {row[3]}. " + MESSAGES_ADMIN.CONFIRM_YES_NO)
         except Exception:
-            await update.message.reply_text(f"Вы выбрали: Фамилия: {row[1]} | Имя: {row[2]} | Отчество: {row[3]}. Удалить? 1. Да 2. Нет")
+            await update.message.reply_text(f"Вы выбрали: Фамилия: {row[1]} | Имя: {row[2]} | Отчество: {row[3]}. " + MESSAGES_ADMIN.CONFIRM_YES_NO)
         context.user_data['delrecord_awaiting_choice'] = False
         context.user_data['delrecord_awaiting_confirm'] = True
 
@@ -89,7 +90,7 @@ class DelRecord:
                     cursor.execute('SELECT rowid, ' + ', '.join(self.db_fields) + ' FROM members WHERE rowid = ?', (rowid,))
                     r = cursor.fetchone()
                     if not r:
-                        await update.message.reply_text('Запись не найдена для удаления.')
+                        await update.message.reply_text(MESSAGES_ADMIN.RECORD_NOT_FOUND)
                         context.user_data['delrecord_repeat_or_exit'] = True
                     else:
                         # r: (rowid, surname, name, ...)
@@ -103,15 +104,15 @@ class DelRecord:
                                 r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11], r[12], r[13], r[14], r[15], r[16]
                             ))
                         except Exception:
-                            await update.message.reply_text('Ошибка при архивировании записи. Удаление отменено.')
+                            await update.message.reply_text(MESSAGES_ADMIN.ERROR_SELECT.format(error='Ошибка при архивировании записи. Удаление отменено.'))
                             context.user_data['delrecord_repeat_or_exit'] = True
                             return
                         # Если архивирование прошло успешно — удалить исходную запись
                         cursor.execute('DELETE FROM members WHERE rowid = ?', (rowid,))
                         try:
-                            await send_and_track(context, update.message, 'Запись успешно удалена и перемещена в архив! Повторить удаление? 1. Да 2. Выход')
+                            await send_and_track(context, update.message, MESSAGES_ADMIN.DELETE_SUCCESS_REPEAT)
                         except Exception:
-                            await update.message.reply_text('Запись успешно удалена и перемещена в архив! Повторить удаление? 1. Да 2. Выход')
+                            await update.message.reply_text(MESSAGES_ADMIN.DELETE_SUCCESS_REPEAT)
                         context.user_data['delrecord_repeat_or_exit'] = True
             except Exception as e:
                 await update.message.reply_text(f'Ошибка при удалении: {e}')
@@ -128,12 +129,12 @@ class DelRecord:
             except Exception:
                 pass
             try:
-                await send_and_track(context, update.message, '1. Повторить поиск\n2. Выход')
+                await send_and_track(context, update.message, MESSAGES_ADMIN.SEARCH_REPEAT_EXIT)
             except Exception:
-                await update.message.reply_text('1. Повторить поиск\n2. Выход')
+                await update.message.reply_text(MESSAGES_ADMIN.SEARCH_REPEAT_EXIT)
             context.user_data['delrecord_repeat_or_exit'] = True
         else:
-            await update.message.reply_text('Введите 1 (Да) или 2 (Нет).')
+            await update.message.reply_text(MESSAGES_ADMIN.REPEAT_OR_EXIT_PROMPT)
 
         context.user_data['delrecord_awaiting_confirm'] = False
 
@@ -146,13 +147,13 @@ class DelRecord:
         elif text == '2':
             # Выход — вернуться к меню администратора
             try:
-                await send_and_track(context, update.message, 'Выберите действие администратора:\n1. Показать весь список.\n2. Найти по фамилии.\n3. Редактировать данные.\n4. Добавить данные.\n5. Удалить данные.\nВведите номер действия:')
+                await send_and_track(context, update.message, MESSAGES_ADMIN.ADMIN_MAIN_MENU)
             except Exception:
-                await update.message.reply_text('Выберите действие администратора:\n1. Показать весь список.\n2. Найти по фамилии.\n3. Редактировать данные.\n4. Добавить данные.\n5. Удалить данные.\nВведите номер действия:')
+                await update.message.reply_text(MESSAGES_ADMIN.ADMIN_MAIN_MENU)
             context.user_data['delrecord_repeat_or_exit'] = False
             context.user_data['admin_mode'] = True
         else:
-            await update.message.reply_text('Введите 1 (повторить) или 2 (выход).')
+            await update.message.reply_text(MESSAGES_ADMIN.REPEAT_OR_EXIT_PROMPT)
 
     async def delete_member_by_id(self, update, context, member_id):
         """
@@ -172,9 +173,9 @@ class DelRecord:
                 r = cursor.fetchone()
                 if not r:
                     try:
-                        await send_and_track(context, update.message, 'Запись не найдена для удаления.')
+                        await send_and_track(context, update.message, MESSAGES_ADMIN.RECORD_NOT_FOUND)
                     except Exception:
-                        await update.message.reply_text('Запись не найдена для удаления.')
+                        await update.message.reply_text(MESSAGES_ADMIN.RECORD_NOT_FOUND)
                     return
 
                 # Формируем компактный текст: только значения полей (без названий)
@@ -186,7 +187,7 @@ class DelRecord:
                 # Inline-подтверждение: Да / Нет
                 from telegram import InlineKeyboardMarkup, InlineKeyboardButton
                 kb = InlineKeyboardMarkup([
-                    [InlineKeyboardButton('Да', callback_data=f'delrec:yes:{member_id}'), InlineKeyboardButton('Нет', callback_data=f'delrec:no:{member_id}')]
+                    [InlineKeyboardButton(MESSAGES_ADMIN.BTN_YES, callback_data=f'delrec:yes:{member_id}'), InlineKeyboardButton(MESSAGES_ADMIN.BTN_NO, callback_data=f'delrec:no:{member_id}')]
                 ])
                 try:
                     sent = await update.message.reply_text(f'Запись:\n{record_text}\nУдалить?', reply_markup=kb)

@@ -4,6 +4,7 @@ from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQu
 import settings
 import logging
 from db.models import User
+import messages_admin as MESSAGES_ADMIN
 
 
 async def _delete_message_later(bot, chat_id: int, message_id: int, delay_seconds: int = 10):
@@ -28,8 +29,12 @@ async def start_command(update, context):
     # Ответ на команду /start с кнопками
     # Клавиатура (используется, когда нужно показать пользователю), но по умолчанию скрыта
     keyboard = [["Новости", "Фото"], ["Видео", "Контакты"], ["Справка", "ДП"]]
-    # Inline-клавиатура приветствия: сначала кнопка "Меню бота", затем "Справка"
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton('Меню бота', callback_data='menu:show'), InlineKeyboardButton('Справка', callback_data='help:show')]])
+    # Inline-клавиатура приветствия: кнопка вызова Reply-клавиатуры (Menu), Справка
+    # и дополнительная кнопка-открывашка для выпадающего inline-меню (dropdown).
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(MESSAGES_ADMIN.BTN_MENU, callback_data='menu:show'), InlineKeyboardButton(MESSAGES_ADMIN.BTN_HELP, callback_data='help:show')],
+        [InlineKeyboardButton(MESSAGES_ADMIN.BTN_MENU_TOGGLE, callback_data='dropdown:toggle')]
+    ])
     # Используем message из Update (если есть)
     msg_obj = update.message if getattr(update, 'message', None) else (update.callback_query.message if getattr(update, 'callback_query', None) else None)
     greeting_text = "Добро пожаловать! Я бот Анжеро-Судженской МО ВОС. Чем могу помочь?"
@@ -83,7 +88,7 @@ async def help_callback(update, context):
     if data == 'help:show':
         # Отправляем сообщение со справкой и кнопку "Закрыть справку"
         try:
-            kb_help = InlineKeyboardMarkup([[InlineKeyboardButton('Закрыть справку', callback_data='help:close')]])
+            kb_help = InlineKeyboardMarkup([[InlineKeyboardButton(MESSAGES_ADMIN.BTN_CLOSE_HELP, callback_data='help:close')]])
             sent = await origin.reply_text(help_text, reply_markup=kb_help)
             # Сохраним sent message id для последующего удаления
             if getattr(sent, 'chat', None):
@@ -92,7 +97,7 @@ async def help_callback(update, context):
             logging.exception('Не удалось отправить справку по callback')
         # Изменим клавиатуру на исходном сообщении — заменим кнопку на "Закрыть справку"
         try:
-            kb_toggle = InlineKeyboardMarkup([[InlineKeyboardButton('Закрыть справку', callback_data='help:close')]])
+            kb_toggle = InlineKeyboardMarkup([[InlineKeyboardButton(MESSAGES_ADMIN.BTN_CLOSE_HELP, callback_data='help:close')]])
             await origin.edit_reply_markup(reply_markup=kb_toggle)
         except Exception:
             # редактирование может быть недоступно — игнорируем
@@ -123,7 +128,7 @@ async def menu_callback(update, context):
             logging.exception('Не удалось отправить главное меню по callback')
         # Изменим клавиатуру на исходном сообщении — заменим кнопку на "Закрыть меню"
         try:
-            kb_toggle = InlineKeyboardMarkup([[InlineKeyboardButton('Закрыть меню', callback_data='menu:close'), InlineKeyboardButton('Справка', callback_data='help:show')]])
+            kb_toggle = InlineKeyboardMarkup([[InlineKeyboardButton(MESSAGES_ADMIN.BTN_CLOSE_MENU, callback_data='menu:close'), InlineKeyboardButton(MESSAGES_ADMIN.BTN_HELP, callback_data='help:show')]])
             await origin.edit_reply_markup(reply_markup=kb_toggle)
         except Exception:
             logging.debug('Не удалось изменить клавиатуру исходного сообщения (menu:show)')
@@ -152,7 +157,7 @@ async def menu_callback(update, context):
             logging.debug('Не удалось отправить сообщение с удалением ReplyKeyboard')
         # Восстановим inline-кнопку на исходном сообщении обратно на 'Меню бота'
         try:
-            kb_restore = InlineKeyboardMarkup([[InlineKeyboardButton('Меню бота', callback_data='menu:show'), InlineKeyboardButton('Справка', callback_data='help:show')]])
+            kb_restore = InlineKeyboardMarkup([[InlineKeyboardButton(MESSAGES_ADMIN.BTN_MENU, callback_data='menu:show'), InlineKeyboardButton(MESSAGES_ADMIN.BTN_HELP, callback_data='help:show')]])
             await origin.edit_reply_markup(reply_markup=kb_restore)
         except Exception:
             logging.debug('Не удалось восстановить клавиатуру исходного сообщения (menu:close)')
@@ -168,7 +173,7 @@ async def menu_callback(update, context):
                 logging.debug('Не удалось удалить сообщение со справкой')
         # Восстановим кнопку на исходном сообщении обратно на 'Справка'
         try:
-            kb_restore = InlineKeyboardMarkup([[InlineKeyboardButton('Справка', callback_data='help:show')]])
+            kb_restore = InlineKeyboardMarkup([[InlineKeyboardButton(MESSAGES_ADMIN.BTN_HELP, callback_data='help:show')]])
             await origin.edit_reply_markup(reply_markup=kb_restore)
         except Exception:
             logging.debug('Не удалось восстановить клавиатуру исходного сообщения (help:close)')
@@ -234,22 +239,22 @@ async def admin_message(update, context):
                 pass
         # Отправляем сообщение и Inline-клавиатуру с действиями (кнопки отправляют callback_data 'admin:1'..'admin:6')
         try:
-            sent_header = await update.message.reply_text("Режим администратора: доступ разрешён.")
+            sent_header = await update.message.reply_text(MESSAGES_ADMIN.ADMIN_HEADER)
             # Сохраним id заголовочного сообщения админа, чтобы его можно было удалять при показе списков
             if getattr(sent_header, 'chat', None):
                 context.user_data['admin_header_message'] = (sent_header.chat.id, sent_header.message_id)
         except Exception:
             logging.exception('Не удалось отправить заголовок режима администратора')
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton('1. Показать весь список', callback_data='admin:1')],
-            [InlineKeyboardButton('2. Найти по фамилии', callback_data='admin:2')],
-            [InlineKeyboardButton('3. Редактировать запись', callback_data='admin:3')],
-            [InlineKeyboardButton('4. Добавить запись', callback_data='admin:4')],
-            [InlineKeyboardButton('5. Удалить запись', callback_data='admin:5')],
-            [InlineKeyboardButton('6. Сортировка и фильтр', callback_data='admin:6')]
+            [InlineKeyboardButton(MESSAGES_ADMIN.BTN_ADMIN_OPT1, callback_data='admin:1')],
+            [InlineKeyboardButton(MESSAGES_ADMIN.BTN_ADMIN_OPT2, callback_data='admin:2')],
+            [InlineKeyboardButton(MESSAGES_ADMIN.BTN_ADMIN_OPT3, callback_data='admin:3')],
+            [InlineKeyboardButton(MESSAGES_ADMIN.BTN_ADMIN_OPT4, callback_data='admin:4')],
+            [InlineKeyboardButton(MESSAGES_ADMIN.BTN_ADMIN_OPT5, callback_data='admin:5')],
+            [InlineKeyboardButton(MESSAGES_ADMIN.BTN_ADMIN_OPT6, callback_data='admin:6')]
         ])
         try:
-            sent_menu = await update.message.reply_text('Выберите действие:', reply_markup=kb)
+            sent_menu = await update.message.reply_text(MESSAGES_ADMIN.ADMIN_MENU_PROMPT, reply_markup=kb)
             if getattr(sent_menu, 'chat', None):
                 context.user_data['admin_menu_message'] = (sent_menu.chat.id, sent_menu.message_id)
         except Exception:
@@ -583,6 +588,101 @@ async def admin_callback(update, context):
         except Exception:
             pass
     return
+
+
+async def dropdown_callback(update, context):
+    """Обработчик для простого выпадающего inline-меню (открыть/закрыть и показ пунктов)."""
+    query = update.callback_query
+    data = getattr(query, 'data', '')
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    # Открыть выпадающее меню — показать список пунктов как InlineKeyboard
+    if data in ('dropdown:toggle', 'dropdown:open'):
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(MESSAGES_ADMIN.BTN_INLINE_NEWS, callback_data='inline_menu:news')],
+            [InlineKeyboardButton(MESSAGES_ADMIN.BTN_INLINE_PHOTO, callback_data='inline_menu:photo')],
+            [InlineKeyboardButton(MESSAGES_ADMIN.BTN_INLINE_VIDEO, callback_data='inline_menu:video')],
+            [InlineKeyboardButton(MESSAGES_ADMIN.BTN_INLINE_CONTACTS, callback_data='inline_menu:contacts')],
+            [InlineKeyboardButton(MESSAGES_ADMIN.BTN_INLINE_CLOSE, callback_data='dropdown:close')]
+        ])
+        try:
+            await query.edit_message_text('Выберите пункт меню:', reply_markup=kb)
+        except Exception:
+            try:
+                await query.message.reply_text('Выберите пункт меню:', reply_markup=kb)
+            except Exception:
+                pass
+        return
+
+    # Закрыть выпадающее меню — восстановить первоначальную клавиатуру
+    if data == 'dropdown:close':
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(MESSAGES_ADMIN.BTN_MENU, callback_data='menu:show'), InlineKeyboardButton(MESSAGES_ADMIN.BTN_HELP, callback_data='help:show')],
+            [InlineKeyboardButton(MESSAGES_ADMIN.BTN_MENU_TOGGLE, callback_data='dropdown:toggle')]
+        ])
+        try:
+            # Попытка вернуть исходный текст приветствия (корректнее, если это сообщение-приветствие)
+            await query.edit_message_text('Добро пожаловать! Я бот Анжеро-Судженской МО ВОС. Чем могу помочь?', reply_markup=kb)
+        except Exception:
+            try:
+                await query.message.reply_text('Добро пожаловать! Я бот Анжеро-Судженской МО ВОС. Чем могу помочь?', reply_markup=kb)
+            except Exception:
+                pass
+        return
+
+
+async def inline_menu_callback(update, context):
+    """Обработка выбора пункта из inline-выпадающего меню."""
+    query = update.callback_query
+    data = getattr(query, 'data', '')
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    # Простая маршрутизация — отправляем текстовые ответы, можно интегрировать с существующими handlers
+    if data == 'inline_menu:news':
+        try:
+            await query.message.reply_text("Новости: Здесь будут последние новости организации.")
+        except Exception:
+            try:
+                await context.bot.send_message(chat_id=query.from_user.id, text="Новости: Здесь будут последние новости организации.")
+            except Exception:
+                pass
+        return
+
+    if data == 'inline_menu:photo':
+        try:
+            await query.message.reply_text("Фото: Здесь будут опубликованы фотографии мероприятий.")
+        except Exception:
+            try:
+                await context.bot.send_message(chat_id=query.from_user.id, text="Фото: Здесь будут опубликованы фотографии мероприятий.")
+            except Exception:
+                pass
+        return
+
+    if data == 'inline_menu:video':
+        try:
+            await query.message.reply_text("Видео: Здесь будут опубликованы видеоматериалы.")
+        except Exception:
+            try:
+                await context.bot.send_message(chat_id=query.from_user.id, text="Видео: Здесь будут опубликованы видеоматериалы.")
+            except Exception:
+                pass
+        return
+
+    if data == 'inline_menu:contacts':
+        try:
+            await query.message.reply_text("Контакты: +7 (38453) 6-18-85, amvos42@gmail.com")
+        except Exception:
+            try:
+                await context.bot.send_message(chat_id=query.from_user.id, text="Контакты: +7 (38453) 6-18-85, amvos42@gmail.com")
+            except Exception:
+                pass
+        return
     
 
 
@@ -649,6 +749,10 @@ def main():
     application.add_handler(CallbackQueryHandler(help_callback, pattern=r'^help:'))
     # CallbackQuery для inline-кнопки Меню бота (show/close)
     application.add_handler(CallbackQueryHandler(menu_callback, pattern=r'^menu:'))
+    # CallbackQuery для простого выпадающего inline-меню (dropdown)
+    application.add_handler(CallbackQueryHandler(dropdown_callback, pattern=r'^dropdown:'))
+    # CallbackQuery для пунктов выпадающего inline-меню
+    application.add_handler(CallbackQueryHandler(inline_menu_callback, pattern=r'^inline_menu:'))
     # Обработчик для сообщения '?' чтобы показать справку
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'(?i)^\s*\?\s*$'), help_message))
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'(?i)новости'), news_message))

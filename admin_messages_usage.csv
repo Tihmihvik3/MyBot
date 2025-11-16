@@ -1,0 +1,10 @@
+constant,number,description,used_in_files
+FILTER_INVALID_FIELD,1.61,"Выберите корректный номер поля для фильтрации.",db/sort_and_filtr.py
+RETURN_MENU_INVALID_CHOICE,1.62,"Пожалуйста, выберите 1 (сохранить) или 2 (не сохранять).",db/sort_and_filtr.py
+CONFIRM_YES_NO,1.63,"Введите 1 (Да) или 2 (Нет).",db/del_record.py
+REPEAT_OR_EXIT_PROMPT,1.64,"Введите 1 (повторить) или 2 (выход).",db/del_record.py
+SELECTED_RECORD_TEMPLATE,1.65,"Шаблон: Вы выбрали: Фамилия: {surname} | Имя: {name} | Отчество: {patronymic}",db/edit_db.py;db/del_record.py
+FOUND_RECORD_TEMPLATE,1.66,"Шаблон: Найдена запись: Фамилия: {surname} | Имя: {name} | Отчество: {patronymic}.",(зарезервировано) 
+
+# Примечание: это краткий CSV со списком новых констант, добавленных во время последней итерации.
+# Для полного списка всех констант используйте файл messages_admin.py

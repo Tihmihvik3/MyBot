@@ -1,5 +1,6 @@
 import logging
 from utils.admin_messenger import send_and_track, delete_tracked_messages
+import messages_admin as MESSAGES_ADMIN
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +33,7 @@ class AddRecord:
             # Показать информационное сообщение перед началом заполнения карточки
             try:
                 if getattr(update, 'message', None):
-                    sent_header = await update.message.reply_text('Заполнение карточки члена ВОС:')
+                    sent_header = await update.message.reply_text(MESSAGES_ADMIN.ADD_RECORD_HEADER)
                     try:
                         context.user_data['add_record_header_message'] = (sent_header.chat.id, sent_header.message_id)
                     except Exception:
@@ -41,7 +42,7 @@ class AddRecord:
                     # fallback
                     uid = getattr(update.callback_query.from_user, 'id', None) if getattr(update, 'callback_query', None) else None
                     if uid:
-                        sent_header = await context.bot.send_message(chat_id=uid, text='Заполнение карточки члена ВОС:')
+                        sent_header = await context.bot.send_message(chat_id=uid, text=MESSAGES_ADMIN.ADD_RECORD_HEADER)
                         try:
                             context.user_data['add_record_header_message'] = (sent_header.chat.id, sent_header.message_id)
                         except Exception:
@@ -53,7 +54,7 @@ class AddRecord:
         except Exception:
             logger.exception('start_add: send_and_track failed; falling back')
             try:
-                await update.message.reply_text('Введите Фамилию:')
+                await update.message.reply_text(MESSAGES_ADMIN.ENTER_FIELD_TEMPLATE.format(field='Фамилию'))
             except Exception:
                 pass
         context.user_data['add_record_in_progress'] = True
@@ -65,14 +66,14 @@ class AddRecord:
         row = []
         # 'Назад' available starting from step >= 1
         if step >= 1:
-            row.append(InlineKeyboardButton('Назад', callback_data='workdb:add:back'))
-        row.append(InlineKeyboardButton('Отмена', callback_data='workdb:add:cancel'))
+            row.append(InlineKeyboardButton(MESSAGES_ADMIN.BTN_BACK, callback_data='workdb:add:back'))
+        row.append(InlineKeyboardButton(MESSAGES_ADMIN.BTN_CANCEL, callback_data='workdb:add:cancel'))
         buttons.append(row)
         return InlineKeyboardMarkup(buttons)
 
     async def ask_step(self, update, context, step: int):
         """Отправить (или отредактировать) приглашение для текущего шага добавления."""
-        text = f'Введите {self.fields[step]}:'
+        text = MESSAGES_ADMIN.ENTER_FIELD_TEMPLATE.format(field=self.fields[step])
         kb = self._build_kb(step)
         # Сохраним текущую ожидаемую ступень
         context.user_data['add_record_step'] = step
@@ -131,7 +132,7 @@ class AddRecord:
                     values = [data.get(f, '') for f in self.db_fields]
                     cursor.execute(f'INSERT INTO members ({fields_str}) VALUES ({placeholders})', values)
                 # Показываем пользователю, что сохранено
-                msg = 'Запись успешно добавлена!\nСохранённые данные:\n'
+                msg = MESSAGES_ADMIN.ADD_SUCCESS_HEADER + '\n' + MESSAGES_ADMIN.ADD_SUMMARY_HEADER + '\n'
                 for i, field in enumerate(self.fields):
                     msg += f"{field}: {data.get(self.db_fields[i], '')}\n"
                 try:
@@ -150,9 +151,9 @@ class AddRecord:
                 except Exception:
                     pass
                 try:
-                    await send_and_track(context, update.message, 'Выберите действие:\n1. Продолжить добавление записей\n2. Выход')
+                    await send_and_track(context, update.message, MESSAGES_ADMIN.ADD_CONTINUE_PROMPT)
                 except Exception:
-                    await update.message.reply_text('Выберите действие:\n1. Продолжить добавление записей\n2. Выход')
+                    await update.message.reply_text(MESSAGES_ADMIN.ADD_CONTINUE_PROMPT)
                 context.user_data['add_record_continue_or_exit'] = True
             except Exception as e:
                 await update.message.reply_text(f'Ошибка при добавлении: {e}')
@@ -178,11 +179,11 @@ class AddRecord:
                         pass
             except Exception:
                 pass
-            await update.message.reply_text('Выберите действие администратора:\n1. Показать весь список.\n2. Найти по фамилии.\n3. Редактировать данные.\n4. Добавить данные.\n5. Удалить данные.\nВведите номер действия:')
+            await update.message.reply_text(MESSAGES_ADMIN.ADMIN_MAIN_MENU)
             context.user_data['add_record_continue_or_exit'] = False
             context.user_data['admin_mode'] = True
         else:
-            await update.message.reply_text('Введите 1 (продолжить) или 2 (выход).')
+            await update.message.reply_text(MESSAGES_ADMIN.ENTER_1_OR_2)
 
     async def process_state(self, update, context):
         """

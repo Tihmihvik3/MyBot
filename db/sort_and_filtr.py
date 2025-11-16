@@ -4,6 +4,7 @@ from db.database import Database
 from telegram import InlineKeyboardMarkup, InlineKeyboardButton
 import traceback
 from admin_notify import notify_admin
+import messages_admin as MESSAGES_ADMIN
 
 
 logger = logging.getLogger(__name__)
@@ -18,7 +19,7 @@ class SortAndFiltr:
             await cleanup_admin_messages(context, bot=context.bot, logger_obj=logger)
         except Exception:
             logger.exception('SortAndFiltr.start: cleanup failed')
-        await update.message.reply_text('Выберите действие:\n1. Сортировать по\n2. Фильтровать по\n0. Выйти')
+        await update.message.reply_text(MESSAGES_ADMIN.SORT_ACTIONS_PROMPT)
         context.user_data['sortfiltr_awaiting_action'] = True  # Ожидаем действие пользователя
         
     async def handle_action(self, update, context):
@@ -33,7 +34,7 @@ class SortAndFiltr:
         context.user_data['sortfiltr_page'] = 1
         context.user_data['sortfiltr_page_size'] = context.user_data.get('sortfiltr_page_size', self.PAGE_SIZE_DEFAULT)
         if context.user_data['sortfiltr_choice'] == '1':
-            await update.message.reply_text('Выберите поле для сортировки:\n1. По фамилии\n2. По группе инвалидности\n3. По группам\n4. По полу\n0. выйти')
+            await update.message.reply_text(MESSAGES_ADMIN.SORT_FIELD_PROMPT)
             context.user_data['sortfiltr_awaiting_sort_field'] = True  # Ожидаем выбор поля для сортировки
             context.user_data['sortfiltr_awaiting_action'] = False  # Ожидаем, что пользователь выберет поле для сортировки
         elif context.user_data['sortfiltr_choice'] == '2':
@@ -42,13 +43,13 @@ class SortAndFiltr:
             context.user_data['sortfiltr_awaiting_action'] = False
         elif context.user_data['sortfiltr_choice'] == '0':
             # Выход из SortAndFiltr и возврат к admin_message
-            await update.message.reply_text('Возврат в главное меню администратора.')
+            await update.message.reply_text(MESSAGES_ADMIN.ADMIN_EXIT_TO_MENU)
             from bot import admin_message
             await admin_message(update, context)
             context.user_data['sortfiltr_awaiting_action'] = False
             context.user_data['sortfiltr_awaiting_sort_field'] = False
         else:
-            await update.message.reply_text('Введите 1 (сортировать) или 2 (фильтровать).')
+            await update.message.reply_text(MESSAGES_ADMIN.SORT_CHOICE_PROMPT)
             await self.start(update, context)
             context.user_data['sortfiltr_awaiting_sort_field'] = False  # Сброс ожидания выбора поля сортировки
 
@@ -79,7 +80,7 @@ class SortAndFiltr:
             await self.start(update, context)
             context.user_data['sortfiltr_awaiting_sort_field'] = False
         else:
-            await update.message.reply_text('Введите номер поля из списка.')
+            await update.message.reply_text(MESSAGES_ADMIN.ENTER_FIELD_NUMBER)
 
     async def handle_filter_field(self, update, context):
         text = update.message.text.strip()
@@ -101,37 +102,37 @@ class SortAndFiltr:
             context.user_data['sortfiltr_filter_field'] = db_field
             context.user_data['sortfiltr_page'] = 1
             # Спросим значение для фильтрации
-            await update.message.reply_text(f'Введите значение для фильтрации по полю "{pretty}" (частичное совпадение):')
+            await update.message.reply_text(MESSAGES_ADMIN.FILTER_VALUE_PROMPT.format(field=pretty))
             context.user_data['sortfiltr_awaiting_filter_value'] = True
             context.user_data['sortfiltr_awaiting_filter_field'] = False
         else:
-            await update.message.reply_text('Выберите корректный номер поля для фильтрации.')
+            await update.message.reply_text(MESSAGES_ADMIN.FILTER_INVALID_FIELD)
 
     async def send_filter_field_keyboard(self, update, context):
         """Отправляет inline-клавиатуру с полями для фильтрации."""
         buttons = [
-            [InlineKeyboardButton('Фамилия', callback_data='sortfiltr:filter:surname'), InlineKeyboardButton('Группа инвалидности', callback_data='sortfiltr:filter:group_disability')],
-            [InlineKeyboardButton('Группа', callback_data='sortfiltr:filter:`group`'), InlineKeyboardButton('Пол', callback_data='sortfiltr:filter:floor')],
-            [InlineKeyboardButton('Район', callback_data='sortfiltr:filter:area'), InlineKeyboardButton('Телефон', callback_data='sortfiltr:filter:phone')],
-            [InlineKeyboardButton('Отмена', callback_data='sortfiltr:filter:cancel')]
+            [InlineKeyboardButton(MESSAGES_ADMIN.BTN_FIELD_SURNAME, callback_data='sortfiltr:filter:surname'), InlineKeyboardButton(MESSAGES_ADMIN.BTN_FIELD_GROUP_DISABILITY, callback_data='sortfiltr:filter:group_disability')],
+            [InlineKeyboardButton(MESSAGES_ADMIN.BTN_FIELD_GROUP, callback_data='sortfiltr:filter:`group`'), InlineKeyboardButton(MESSAGES_ADMIN.BTN_FIELD_FLOOR, callback_data='sortfiltr:filter:floor')],
+            [InlineKeyboardButton(MESSAGES_ADMIN.BTN_FIELD_AREA, callback_data='sortfiltr:filter:area'), InlineKeyboardButton(MESSAGES_ADMIN.BTN_FIELD_PHONE, callback_data='sortfiltr:filter:phone')],
+            [InlineKeyboardButton(MESSAGES_ADMIN.BTN_CANCEL, callback_data='sortfiltr:filter:cancel')]
         ]
         kb = InlineKeyboardMarkup(buttons)
         # При CallbackQuery используем .message, иначе .message от Update
         target = getattr(update, 'callback_query', None)
         if target:
-            await target.message.reply_text('Выберите поле для фильтрации:', reply_markup=kb)
+            await target.message.reply_text(MESSAGES_ADMIN.FILTER_FIELD_PROMPT, reply_markup=kb)
         else:
-            await update.message.reply_text('Выберите поле для фильтрации:', reply_markup=kb)
+            await update.message.reply_text(MESSAGES_ADMIN.FILTER_FIELD_PROMPT, reply_markup=kb)
 
     def _build_pagination_markup(self, page: int, total: int) -> InlineKeyboardMarkup:
         buttons = []
         row = []
         if page > 1:
-            row.append(InlineKeyboardButton('◀', callback_data='sortfiltr:page:prev'))
+            row.append(InlineKeyboardButton(MESSAGES_ADMIN.BTN_PAG_PREV, callback_data='sortfiltr:page:prev'))
         row.append(InlineKeyboardButton(f'{page}/{total}', callback_data='sortfiltr:page:info'))
         if page < total:
-            row.append(InlineKeyboardButton('▶', callback_data='sortfiltr:page:next'))
-        row.append(InlineKeyboardButton('Выход', callback_data='sortfiltr:page:exit'))
+            row.append(InlineKeyboardButton(MESSAGES_ADMIN.BTN_PAG_NEXT, callback_data='sortfiltr:page:next'))
+        row.append(InlineKeyboardButton(MESSAGES_ADMIN.BTN_EXIT, callback_data='sortfiltr:page:exit'))
         buttons.append(row)
         return InlineKeyboardMarkup(buttons)
 
@@ -197,7 +198,7 @@ class SortAndFiltr:
                     cursor.execute('SELECT COUNT(*) FROM members')
                     total = cursor.fetchone()[0]
                 if total == 0:
-                    await update.message.reply_text('В базе нет данных.')
+                    await update.message.reply_text(MESSAGES_ADMIN.DB_EMPTY)
                     return
                 total_pages = (total + page_size - 1) // page_size
                 if page < 1:
@@ -212,7 +213,7 @@ class SortAndFiltr:
                 else:
                     cursor.execute(query, (page_size, offset))
                 rows = cursor.fetchall()
-                msg = f"{title} (страница {page}/{total_pages}):\n"
+                msg = MESSAGES_ADMIN.LIST_PAGE_TEMPLATE.format(title=title, page=page, total_pages=total_pages) + "\n"
                 messages = []
                 for idx, row in enumerate(rows, offset + 1):
                     # формируем строку из полей через ' | ' если есть первый столбец группы
@@ -234,7 +235,7 @@ class SortAndFiltr:
                 context.user_data['sortfiltr_current_sort'] = current_sort_key
                 # Отправляем inline-клавиатуру пагинации
                 kb = self._build_pagination_markup(page, total_pages)
-                await update.message.reply_text('Навигация по страницам:', reply_markup=kb)
+                await update.message.reply_text(MESSAGES_ADMIN.PAGINATION_NAV_PROMPT, reply_markup=kb)
             return
         except Exception as e:
             logger.exception('Ошибка при пагинации сортировки')
@@ -242,13 +243,13 @@ class SortAndFiltr:
                 await notify_admin(context, 'Ошибка при пагинации сортировки (sort_and_filtr)', traceback.format_exc())
             except Exception:
                 pass
-            await update.message.reply_text(f'Ошибка при сортировке: {e}')
+            await update.message.reply_text(MESSAGES_ADMIN.ERROR_SORTING.format(error=e))
 
     async def handle_filter_value(self, update, context):
         value = update.message.text.strip()
         field = context.user_data.get('sortfiltr_filter_field')
         if not field:
-            await update.message.reply_text('Поле для фильтрации не выбрано. Вернитесь в меню фильтрации.')
+            await update.message.reply_text(MESSAGES_ADMIN.FILTER_FIELD_PROMPT + ' ' + MESSAGES_ADMIN.ADMIN_EXIT_TO_MENU)
             await self.start(update, context)
             return
         # Подготовим SQL с WHERE и параметры
@@ -271,18 +272,17 @@ class SortAndFiltr:
     async def handle_action_without_set(self, update, context):
         choice = context.user_data.get('sortfiltr_choice')
         if choice == '1':
-            await update.message.reply_text('Выберите поле для сортировки:\n1. По фамилии\n2. По группе инвалидности\n3. По группам\n4. По полу')
+            await update.message.reply_text(MESSAGES_ADMIN.SORT_FIELD_PROMPT)
             context.user_data['sortfiltr_awaiting_sort_field'] = True
             context.user_data['sortfiltr_awaiting_action'] = False
         elif choice == '2':
-            await update.message.reply_text('Фильтрация по выбранному полю пока не реализована.')
+            await update.message.reply_text(MESSAGES_ADMIN.FILTER_NOT_IMPLEMENTED)
             context.user_data['sortfiltr_awaiting_action'] = False
         else:
-            await update.message.reply_text('Введите 1 (сортировать) или 2 (фильтровать).')
+            await update.message.reply_text(MESSAGES_ADMIN.SORT_CHOICE_PROMPT)
 
     async def show_return_menu(self, update, context):
-        menu_text = "\nВыберите действие после сортировки:\n1. Сохранить изменения\n2. Не сохранять изменения"
-        await update.message.reply_text(menu_text)
+        await update.message.reply_text(MESSAGES_ADMIN.SORT_POST_ACTION_PROMPT)
         context.user_data['awaiting_return_menu'] = True  # Устанавливаем флаг ожидания выбора в меню возврата
 
     async def handle_return_menu_choice(self, update, context):
@@ -290,17 +290,17 @@ class SortAndFiltr:
         if user_reply == '1':
             # Сохранить изменения (пример: коммит в БД, если требуется)
             # Здесь предполагается, что изменения уже внесены в БД, если нет — добавить нужную логику
-            await update.message.reply_text('Изменения сохранены.')
+            await update.message.reply_text(MESSAGES_ADMIN.CHANGES_SAVED)
             await self.start(update, context)
             context.user_data['awaiting_return_menu'] = False
             
         elif user_reply == '2':
-            await update.message.reply_text('Изменения не сохранены.')
+            await update.message.reply_text(MESSAGES_ADMIN.CHANGES_NOT_SAVED)
             await self.start(update, context)
             context.user_data['awaiting_return_menu'] = False
             
         else:
-            await update.message.reply_text('Пожалуйста, выберите 1 (сохранить) или 2 (не сохранять).')
+            await update.message.reply_text(MESSAGES_ADMIN.RETURN_MENU_INVALID_CHOICE)
 
     async def process_state(self, update, context):
         """
@@ -351,7 +351,7 @@ class SortAndFiltr:
         text = update.message.text.strip()
         if text == '0':
             context.user_data['sortfiltr_paginating'] = False
-            await update.message.reply_text('Выход из режима пагинации. Возврат в меню сортировки.')
+            await update.message.reply_text(MESSAGES_ADMIN.PAGINATION_EXIT_PROMPT + ' ' + MESSAGES_ADMIN.ADMIN_EXIT_TO_MENU)
             await self.start(update, context)
             return
 
@@ -364,7 +364,7 @@ class SortAndFiltr:
             if page > 1:
                 page -= 1
         else:
-            await update.message.reply_text("Введите '>' или '<' для навигации, или 0 для выхода.")
+            await update.message.reply_text(MESSAGES_ADMIN.PAGINATION_INSTRUCTIONS)
             return
 
         context.user_data['sortfiltr_page'] = page
@@ -379,7 +379,7 @@ class SortAndFiltr:
         elif current == 'floor':
             await self.sort_floor(update, context)
         else:
-            await update.message.reply_text('Неизвестный режим сортировки.')
+            await update.message.reply_text(MESSAGES_ADMIN.UNKNOWN_SORT_MODE)
 
     async def handle_repeat_or_exit(self, update, context):
         """
@@ -390,7 +390,7 @@ class SortAndFiltr:
         text = update.message.text.strip()
         # Если флаг выставлен и это первый вызов — предложим пользователю выбор
         if text not in ('1', '2'):
-            await update.message.reply_text('Повтор или выход?\n1. Повторить\n2. Выйти')
+            await update.message.reply_text(MESSAGES_ADMIN.SORT_REPEAT_EXIT)
             # Оставляем флаг активным, чтобы следующий ввод был обработан этим методом
             context.user_data['sortfiltr_repeat_or_exit'] = True
             return
@@ -423,13 +423,13 @@ class SortAndFiltr:
         # Обработка выбора поля фильтрации
         if action == 'filter':
             if arg == 'cancel':
-                await query.message.edit_text('Отменено')
+                await query.message.edit_text(MESSAGES_ADMIN.CANCELLED)
                 await self.start(update, context)
                 return
             # Сохраним выбор и попросим ввести значение
             context.user_data['sortfiltr_filter_field'] = arg
             context.user_data['sortfiltr_awaiting_filter_value'] = True
-            await query.message.edit_text(f'Выбрано поле для фильтрации: {arg}. Введите значение (частичное совпадение):')
+            await query.message.edit_text(MESSAGES_ADMIN.FILTER_SELECTED_PROMPT.format(field=arg))
             return
 
         # Пагинация
