@@ -5,6 +5,9 @@ import settings
 import logging
 from db.models import User
 import messages_admin as MESSAGES_ADMIN
+import secrets
+
+from db import notifications as notifications
 
 
 async def _delete_message_later(bot, chat_id: int, message_id: int, delay_seconds: int = 10):
@@ -189,6 +192,105 @@ async def show_menu_command(update, context):
 async def contact_message(update, context):
     # Ответ на сообщение "контакты"
     await update.message.reply_text("Контакты: Вы можете связаться с нами по телефону +7 (38453) 6-18-85 или email amvos42@gmail.com.")
+
+
+async def admin_token_cmd(update, context):
+    from verification_id import VerificationID
+    verifier = VerificationID()
+    role = await verifier.check_role(update, context)
+    if role != 'super admin':
+        await update.message.reply_text('Доступ запрещён. Только super_admin может выполнять эту команду.')
+        return
+    token = secrets.token_urlsafe(24)
+    try:
+        notifications.create_admin_token(token)
+    except Exception:
+        try:
+            notifications.create_admin_token(token)
+        except Exception:
+            logging.exception('Не удалось сохранить admin token')
+    await update.message.reply_text(f'Admin token сгенерирован:\n{token}\nСкопируйте и используйте для входа в панель администратора.')
+
+
+async def notify_set_template_cmd(update, context):
+    from verification_id import VerificationID
+    verifier = VerificationID()
+    role = await verifier.check_role(update, context)
+    if role != 'super admin':
+        await update.message.reply_text('Доступ запрещён.')
+        return
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text('Использование: /notify_set_template <channel> <текст шаблона>')
+        return
+    name = context.args[0]
+    template = ' '.join(context.args[1:])
+    try:
+        notifications.set_template(name, template)
+        await update.message.reply_text(f'Шаблон для канала "{name}" сохранён.')
+    except Exception as e:
+        logging.exception('notify_set_template failed')
+        await update.message.reply_text(f'Ошибка при сохранении шаблона: {e}')
+
+
+async def notify_add_target_cmd(update, context):
+    from verification_id import VerificationID
+    verifier = VerificationID()
+    role = await verifier.check_role(update, context)
+    if role != 'super admin':
+        await update.message.reply_text('Доступ запрещён.')
+        return
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text('Использование: /notify_add_target <channel> <chat_id>')
+        return
+    name = context.args[0]
+    chat_id = context.args[1]
+    try:
+        ch = notifications.get_channel_by_name(name)
+        if not ch:
+            ch_id = notifications.ensure_channel(name, template='')
+        else:
+            ch_id = ch['id']
+        notifications.add_target(ch_id, chat_id)
+        await update.message.reply_text(f'Добавлен получатель {chat_id} для канала "{name}"')
+    except Exception as e:
+        logging.exception('notify_add_target failed')
+        await update.message.reply_text(f'Ошибка при добавлении получателя: {e}')
+
+
+async def notify_list_cmd(update, context):
+    from verification_id import VerificationID
+    verifier = VerificationID()
+    role = await verifier.check_role(update, context)
+    if role != 'super admin':
+        await update.message.reply_text('Доступ запрещён.')
+        return
+    try:
+        if not context.args:
+            chans = notifications.list_channels()
+            if not chans:
+                await update.message.reply_text('Каналов уведомлений не настроено.')
+                return
+            lines = []
+            for c in chans:
+                lines.append(f"{c['name']} (id={c['id']}) enabled={c['enabled']}")
+            await update.message.reply_text('\n'.join(lines))
+            return
+        name = context.args[0]
+        ch = notifications.get_channel_by_name(name)
+        if not ch:
+            await update.message.reply_text('Канал не найден')
+            return
+        targets = notifications.list_targets(ch['id'])
+        tpl = ch.get('template') or ''
+        msg = f"Канал: {name}\nВключён: {ch.get('enabled')}\nШаблон:\n{tpl}\n\nПолучатели:\n"
+        if targets:
+            msg += '\n'.join(str(t) for t in targets)
+        else:
+            msg += 'Нет получателей'
+        await update.message.reply_text(msg)
+    except Exception as e:
+        logging.exception('notify_list failed')
+        await update.message.reply_text(f'Ошибка: {e}')
 
 async def admin_message(update, context):
     # Проверка роли пользователя через VerificationID
@@ -392,6 +494,23 @@ async def admin_callback(update, context):
             from db.search_records import SearchRecords
             sr = SearchRecords()
             # If we have update.message already, call directly
+            # Перед показом запроса удалим служебные админские сообщения (заголовок и меню),
+            # чтобы они не мешали вводу поиска (поведение аналогично choice == '3').
+            try:
+                hdr = context.user_data.pop('admin_header_message', None)
+                menu = context.user_data.pop('admin_menu_message', None)
+                for msg in (hdr, menu):
+                    if msg and isinstance(msg, (list, tuple)) and len(msg) >= 2:
+                        try:
+                            await context.bot.delete_message(chat_id=msg[0], message_id=msg[1])
+                        except Exception:
+                            pass
+            except Exception:
+                try:
+                    logging.exception('admin_callback: failed to cleanup admin header/menu before search')
+                except Exception:
+                    pass
+
             if getattr(update, 'message', None):
                 await sr.start_search(update, context)
             else:
@@ -400,8 +519,8 @@ async def admin_callback(update, context):
                     def __init__(self, chat_id, bot):
                         self.chat = type('C', (), {'id': chat_id})
                         self._bot = bot
-                    async def reply_text(self, text):
-                        return await self._bot.send_message(chat_id=self.chat.id, text=text)
+                    async def reply_text(self, text, **kwargs):
+                        return await self._bot.send_message(chat_id=self.chat.id, text=text, **kwargs)
                 class _FakeUpdate:
                     pass
                 chat_id = query.message.chat.id if getattr(query, 'message', None) and getattr(query.message, 'chat', None) else getattr(query.from_user, 'id', None)
@@ -427,6 +546,22 @@ async def admin_callback(update, context):
             # EditDB: запрос фамилии и запуск режима редактирования
             from db.edit_db import EditDB
             ed = EditDB()
+            # Перед запуском режима редактирования удалим служебные сообщения
+            # администратора (заголовок и меню), чтобы они не мешали вводу.
+            try:
+                hdr = context.user_data.pop('admin_header_message', None)
+                menu = context.user_data.pop('admin_menu_message', None)
+                for msg in (hdr, menu):
+                    if msg and isinstance(msg, (list, tuple)) and len(msg) >= 2:
+                        try:
+                            await context.bot.delete_message(chat_id=msg[0], message_id=msg[1])
+                        except Exception:
+                            pass
+            except Exception:
+                try:
+                    logging.exception('admin_callback: failed to cleanup admin header/menu before edit')
+                except Exception:
+                    pass
             if getattr(update, 'message', None):
                 await ed.search_and_show_fields(update, context)
             else:
@@ -435,8 +570,8 @@ async def admin_callback(update, context):
                     def __init__(self, chat_id, bot):
                         self.chat = type('C', (), {'id': chat_id})
                         self._bot = bot
-                    async def reply_text(self, text):
-                        return await self._bot.send_message(chat_id=self.chat.id, text=text)
+                    async def reply_text(self, text, **kwargs):
+                        return await self._bot.send_message(chat_id=self.chat.id, text=text, **kwargs)
                 class _FakeUpdate:
                     pass
                 chat_id = query.message.chat.id if getattr(query, 'message', None) and getattr(query.message, 'chat', None) else getattr(query.from_user, 'id', None)
@@ -467,8 +602,8 @@ async def admin_callback(update, context):
                     def __init__(self, chat_id, bot):
                         self.chat = type('C', (), {'id': chat_id})
                         self._bot = bot
-                    async def reply_text(self, text):
-                        return await self._bot.send_message(chat_id=self.chat.id, text=text)
+                    async def reply_text(self, text, **kwargs):
+                        return await self._bot.send_message(chat_id=self.chat.id, text=text, **kwargs)
                 class _FakeUpdate:
                     pass
                 chat_id = query.message.chat.id if getattr(query, 'message', None) and getattr(query.message, 'chat', None) else getattr(query.from_user, 'id', None)
@@ -499,8 +634,8 @@ async def admin_callback(update, context):
                     def __init__(self, chat_id, bot):
                         self.chat = type('C', (), {'id': chat_id})
                         self._bot = bot
-                    async def reply_text(self, text):
-                        return await self._bot.send_message(chat_id=self.chat.id, text=text)
+                    async def reply_text(self, text, **kwargs):
+                        return await self._bot.send_message(chat_id=self.chat.id, text=text, **kwargs)
                 class _FakeUpdate:
                     pass
                 chat_id = query.message.chat.id if getattr(query, 'message', None) and getattr(query.message, 'chat', None) else getattr(query.from_user, 'id', None)
@@ -532,8 +667,8 @@ async def admin_callback(update, context):
                     def __init__(self, chat_id, bot):
                         self.chat = type('C', (), {'id': chat_id})
                         self._bot = bot
-                    async def reply_text(self, text):
-                        return await self._bot.send_message(chat_id=self.chat.id, text=text)
+                    async def reply_text(self, text, **kwargs):
+                        return await self._bot.send_message(chat_id=self.chat.id, text=text, **kwargs)
                 class _FakeUpdate:
                     pass
                 chat_id = query.message.chat.id if getattr(query, 'message', None) and getattr(query.message, 'chat', None) else getattr(query.from_user, 'id', None)
@@ -685,6 +820,47 @@ async def inline_menu_callback(update, context):
         return
     
 
+async def search_callback(update, context):
+    """Обработка inline-кнопок поиска (например, 'search:cancel').
+
+    При нажатии 'search:cancel' удаляем приглашение для ввода фамилии и возвращаем
+    пользователя в админ-меню.
+    """
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    # Удалим текущее сообщение (приглашение к вводу фамилии)
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+
+    # Очистим возможные состояния поиска из user_data
+    try:
+        context.user_data.pop('searchrecords_awaiting_surname', None)
+        context.user_data.pop('searchrecords_results', None)
+        context.user_data.pop('searchrecords_awaiting_choice', None)
+        context.user_data.pop('searchrecords_repeat_or_exit', None)
+    except Exception:
+        pass
+
+    # Показать админ-меню
+    try:
+        fake = type('F', (), {})()
+        fake.callback_query = query
+        fake.message = query.message
+        await admin_message(fake, context)
+    except Exception:
+        try:
+            logging.exception('search_callback: failed to return to admin menu')
+        except Exception:
+            pass
+    return
+
+
 
 async def control_entry(update, context):
     """Обработчик, который позволяет пользователю сразу набрать 'диспетчерская' и попасть в диспетчерскую после проверки роли."""
@@ -711,6 +887,11 @@ def main():
 
     # Добавляем обработчик команды /start
     application.add_handler(CommandHandler("start", start_command))
+    # Admin / notification commands (super_admin only)
+    application.add_handler(CommandHandler('admin_token', admin_token_cmd))
+    application.add_handler(CommandHandler('notify_set_template', notify_set_template_cmd))
+    application.add_handler(CommandHandler('notify_add_target', notify_add_target_cmd))
+    application.add_handler(CommandHandler('notify_list', notify_list_cmd))
 
     # Добавляем обработчик сообщений с фильтром на текст "привет"
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'(?i)привет'), greet_user))
@@ -732,6 +913,7 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'(?i)^\s*меню\s*$'), show_menu_command))
     # Добавляем обработчик для получения идентификатора пользователя
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'(?i)получить идентификатор'), get_user_id_message))
+    # (Reply-menu toggle handler removed per user request)
     # Добавляем обработчик для выбора действия админа
     application.add_handler(MessageHandler(filters.TEXT & (~filters.Regex(r'(?i)админ')), admin_action_handler))
     # CallbackQuery для inline-кнопок (фильтрация / пагинация)
@@ -753,6 +935,8 @@ def main():
     application.add_handler(CallbackQueryHandler(dropdown_callback, pattern=r'^dropdown:'))
     # CallbackQuery для пунктов выпадающего inline-меню
     application.add_handler(CallbackQueryHandler(inline_menu_callback, pattern=r'^inline_menu:'))
+    # CallbackQuery для поиска (cancel)
+    application.add_handler(CallbackQueryHandler(search_callback, pattern=r'^search:'))
     # Обработчик для сообщения '?' чтобы показать справку
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'(?i)^\s*\?\s*$'), help_message))
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'(?i)новости'), news_message))

@@ -73,6 +73,8 @@ from control_room.messages import (
 from telegram.error import BadRequest
 from control_room import departure_time
 from control_room import messages as MESSAGES
+from db import notifications as notifications
+from config import Config
 
 
 class ControlRoom:
@@ -198,6 +200,21 @@ class ControlRoom:
             except Exception:
                 pass
         try:
+            # Логируем факт отправки промпта для последующего анализа (метка SENT_PROMPT)
+            try:
+                chat_id = getattr(msg_obj, 'chat', None).id if getattr(msg_obj, 'chat', None) else None
+            except Exception:
+                chat_id = None
+            try:
+                user_id = getattr(msg_obj, 'from_user', None).id if getattr(msg_obj, 'from_user', None) else None
+            except Exception:
+                user_id = None
+            try:
+                self.logger.info(f"SENT_PROMPT chat_id={chat_id!r} user_id={user_id!r} text={text[:200]!r}")
+            except Exception:
+                # не критично, продолжаем отправку
+                pass
+
             sent = await msg_obj.reply_text(text, reply_markup=reply_markup)
             try:
                 await self._record_sent_message(context, sent, text)
@@ -224,6 +241,20 @@ class ControlRoom:
     async def _safe_edit_query(self, query, context, text: str, reply_markup=None, **kwargs):
         """Безопасно редактировать сообщение через CallbackQuery; при отсутствии сообщения — fallback на отправку нового."""
         try:
+            # Логируем факт редактирования промпта (метка EDIT_PROMPT)
+            try:
+                chat = getattr(query, 'message', None).chat if getattr(query, 'message', None) else None
+                chat_id = chat.id if chat else None
+            except Exception:
+                chat_id = None
+            try:
+                user_id = getattr(query, 'from_user', None).id if getattr(query, 'from_user', None) else None
+            except Exception:
+                user_id = None
+            try:
+                self.logger.info(f"EDIT_PROMPT chat_id={chat_id!r} user_id={user_id!r} text={text[:200]!r}")
+            except Exception:
+                pass
             return await query.edit_message_text(text, reply_markup=reply_markup, **kwargs)
         except Exception as e:
             try:
@@ -343,7 +374,13 @@ class ControlRoom:
                 if not rows:
                     msg = update.callback_query.message if getattr(update, 'callback_query', None) else update.message
                     await self._send_and_track(context, msg, NO_REQUESTS)
-                    await self._send_and_track(context, msg, CREATE_INSTRUCTION)
+                    # Вместо текстовой инструкции выводим inline-кнопку "Создать", эквивалентную вводу '0'
+                    try:
+                        kb = InlineKeyboardMarkup([[InlineKeyboardButton(MESSAGES.BTN_CREATE, callback_data='control:create')]])
+                        await self._send_and_track(context, msg, MESSAGES.BTN_CREATE, reply_markup=kb)
+                    except Exception:
+                        # Фолбэк: если что-то пошло не так — отправим простую текстовую инструкцию
+                        await self._send_and_track(context, msg, CREATE_INSTRUCTION)
                     context.user_data['control_room_wait_create'] = True
                     return
 
@@ -822,6 +859,41 @@ class ControlRoom:
         if action == 'noop':
             try:
                 await query.answer()
+            except Exception:
+                pass
+            return
+        # Обработка запроса связи с администратором из меню поиска заказчика
+        if action == 'contact_admin':
+            try:
+                await query.answer()
+            except Exception:
+                pass
+            try:
+                # Информируем пользователя и не продвигаем создание заявки
+                await self._send_and_track(context, query.message, 'Ничего не найдено. Пожалуйста, повторите запрос или обратитесь к администратору бота для помощи.')
+                # Отправим уведомление администратору с деталями запроса помощи
+                try:
+                    last_search = context.user_data.get('control_room_last_customer_search')
+                except Exception:
+                    last_search = None
+                try:
+                    usr = getattr(query.message, 'from_user', None)
+                    uid = getattr(usr, 'id', None)
+                    uname = getattr(usr, 'username', None)
+                    fname = getattr(usr, 'first_name', '') or ''
+                    lname = getattr(usr, 'last_name', '') or ''
+                    fullname = (f"{lname} {fname}".strip() or uname or str(uid))
+                    subject = 'Пользователь запросил помощь администратора (поиск заказчика)'
+                    details = f"Пользователь: id={uid} username={uname} name='{fullname}'\nПоследний запрос: '{last_search}'\nМодуль: control_room"
+                    try:
+                        await notify_admin(context, subject, details)
+                    except Exception:
+                        try:
+                            self.logger.exception('notify_admin failed on contact_admin')
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
             except Exception:
                 pass
             return
@@ -1318,7 +1390,9 @@ class ControlRoom:
                 label = addr if len(addr) <= 63 else addr[:60] + '...'
                 # Включаем direction в callback, чтобы при выборе из полного списка направление было явно задано
                 kb.append([InlineKeyboardButton(label, callback_data=f'control:address:{aid}:{direction}')])
-            kb.append([InlineKeyboardButton(MESSAGES.BTN_BACK, callback_data='control:back'), InlineKeyboardButton(MESSAGES.BTN_CANCEL, callback_data='control:refresh')])
+            # Если вызвано в контексте создания заявки — используем локальную кнопку назад, чтобы не выйти из flow
+            back_cb = 'control:create:prev' if context.user_data.get('control_room_create_in_progress') else 'control:back'
+            kb.append([InlineKeyboardButton(MESSAGES.BTN_BACK, callback_data=back_cb), InlineKeyboardButton(MESSAGES.BTN_CANCEL, callback_data='control:refresh')])
             try:
                 await self._safe_edit_query(query, context, MESSAGES.ALL_ADDRESSES_HEADER, reply_markup=InlineKeyboardMarkup(kb))
             except Exception:
@@ -2006,6 +2080,82 @@ class ControlRoom:
                 return
             value = parsed.isoformat()
 
+        # Если пользователь заполняет поле 'customer' — попробуем найти совпадения по фамилии
+        if key == 'customer':
+            search_term = value.strip()
+            if search_term:
+                try:
+                    # Сохраним последний поисковый запрос в context, чтобы позже его можно было передать администратору
+                    try:
+                        context.user_data['control_room_last_customer_search'] = search_term
+                    except Exception:
+                        pass
+                    with self.db.get_cursor() as cur:
+                        # Поиск по полю surname, нечувствительный к регистру
+                        cur.execute("SELECT id, surname, name, patronymic FROM members WHERE surname LIKE ? COLLATE NOCASE ORDER BY surname LIMIT 50", (search_term + '%',))
+                        rows = cur.fetchall()
+                except Exception:
+                    self.logger.exception('Ошибка при поиске members по фамилии')
+                    rows = []
+                if rows:
+                    # Построить клавиатуру с результатами: отображаем Фамилия Имя Отчество
+                    kb = []
+                    for r in rows:
+                        mid = r[0]
+                        surname = r[1] or ''
+                        name = r[2] or ''
+                        patron = r[3] or ''
+                        label = f"{surname} {name} {patron}".strip()
+                        if len(label) > 63:
+                            label = label[:60] + '...'
+                        kb.append([InlineKeyboardButton(label, callback_data=f'control:member:{mid}')])
+                    kb.append([InlineKeyboardButton(MESSAGES.BTN_BACK, callback_data='control:back'), InlineKeyboardButton(MESSAGES.BTN_CANCEL, callback_data='control:refresh')])
+                    # Отправим заголовок и клавиатуру
+                    try:
+                        await self._send_and_track(context, update.message, 'Выберите чтобы продолжить:', reply_markup=InlineKeyboardMarkup(kb))
+                    except Exception:
+                        try:
+                            await self._send_and_track(context, update.message, SELECT_SHOW_CUSTOMERS, reply_markup=InlineKeyboardMarkup(kb))
+                        except Exception:
+                            # Если не удалось отправить клавиатуру — продолжим как обычный ввод
+                            pass
+                    return
+                else:
+                    # Ничего не найдено: предложим повторить запрос или обратиться к администратору.
+                    try:
+                        kb = InlineKeyboardMarkup([
+                            [InlineKeyboardButton('Повторить поиск', callback_data='control:create:back')],
+                            [InlineKeyboardButton('Обратиться к администратору', callback_data='control:contact_admin')]
+                        ])
+                        await self._send_and_track(context, update.message, f"По запросу '{search_term}' ничего не найдено. Повторите запрос или обратитесь к администратору.", reply_markup=kb)
+                    except Exception:
+                        try:
+                            await self._send_and_track(context, update.message, f"По запросу '{search_term}' ничего не найдено. Повторите запрос или обратитесь к администратору.")
+                        except Exception:
+                            pass
+                    # Уведомим администратора об неудачном поиске
+                    try:
+                        usr = getattr(update, 'message', None).from_user if getattr(update, 'message', None) else None
+                        uid = getattr(usr, 'id', None)
+                        uname = getattr(usr, 'username', None)
+                        fname = getattr(usr, 'first_name', '') or ''
+                        lname = getattr(usr, 'last_name', '') or ''
+                        fullname = (f"{lname} {fname}".strip() or uname or str(uid))
+                        subject = 'Запрос помощи — поиск заказчика (ничего не найдено)'
+                        details = f"Пользователь: id={uid} username={uname} name='{fullname}'\nЗапрос: '{search_term}'\nМодуль: control_room"
+                        try:
+                            await notify_admin(context, subject, details)
+                        except Exception:
+                            # если notify_admin упал — логируем локально
+                            try:
+                                self.logger.exception('notify_admin failed for empty customer search')
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    # Не продолжаем заполнение заявки — ждём повторного ввода/нажатия кнопки
+                    return
+
         # Если поле — время отправления, нормализуем ввод по правилам (модуль departure_time)
         if key == 'departure_time':
             try:
@@ -2032,6 +2182,78 @@ class ControlRoom:
                     confirm_text = f'Время отправления установлено: {norm}'
             sent = None
             try:
+                sent = await update.message.reply_text(confirm_text)
+            except Exception:
+                try:
+                    sent = await self._send_and_track(context, update.message, confirm_text)
+                except Exception:
+                    sent = None
+            if sent:
+                try:
+                    bot = getattr(context, 'bot', None)
+                    if bot and getattr(sent, 'chat', None):
+                        asyncio.create_task(self._delete_message_later(bot, sent.chat.id, sent.message_id, 5))
+                except Exception:
+                    pass
+
+        # Если поле — время прибытия, применяем специальные правила парсинга
+        if key == 'arrival_time':
+            norm = ''
+            s = re.sub(r'\s+', '', value)
+            # Если введён формат с двоеточием (например, 9:30 или 09:30)
+            m_colon = re.match(r'^(\d{1,2}):(\d{1,2})$', s)
+            if m_colon:
+                hh = int(m_colon.group(1))
+                mm = int(m_colon.group(2))
+                if 0 <= hh <= 23 and 0 <= mm <= 59:
+                    norm = f"{hh:02d}:{mm:02d}"
+            else:
+                # Только цифры без разделителей
+                if re.match(r'^\d{1,4}$', s):
+                    L = len(s)
+                    if L == 1:
+                        # '5' -> '05:00'
+                        norm = f"0{s}:00"
+                    elif L == 2:
+                        # '14' -> '14:00'
+                        norm = f"{s}:00"
+                    elif L == 3:
+                        # '930' -> '09:30' (insert ':' after first, pad leading 0)
+                        norm = f"0{s[0]}:{s[1:]}"
+                    elif L == 4:
+                        # '1530' -> '15:30'
+                        norm = f"{s[:2]}:{s[2:]}"
+                else:
+                    norm = ''
+
+            # Валидация результата
+            if not norm:
+                # Неверный формат — предложим повторить ввод
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton(MESSAGES.BTN_BACK, callback_data='control:create:prev'), InlineKeyboardButton(MESSAGES.BTN_CANCEL, callback_data='control:refresh')]
+                ])
+                await self._send_and_track(context, update.message, MESSAGES.INVALID_TIME_FORMAT, reply_markup=kb)
+                return
+
+            # Проверим диапазоны для нормализованного времени
+            try:
+                hh_str, mm_str = norm.split(':')
+                hh = int(hh_str)
+                mm = int(mm_str)
+                if not (0 <= hh <= 23 and 0 <= mm <= 59):
+                    raise ValueError()
+            except Exception:
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton(MESSAGES.BTN_BACK, callback_data='control:create:prev'), InlineKeyboardButton(MESSAGES.BTN_CANCEL, callback_data='control:refresh')]
+                ])
+                await self._send_and_track(context, update.message, MESSAGES.INVALID_TIME_FORMAT, reply_markup=kb)
+                return
+
+            # Принято — используем нормализованное значение
+            value = norm
+            # Краткое подтверждение (удаляется через несколько секунд)
+            try:
+                confirm_text = f'Время прибытия установлено: {value}'
                 sent = await update.message.reply_text(confirm_text)
             except Exception:
                 try:
@@ -2108,12 +2330,12 @@ class ControlRoom:
                 ])
                 await self._send_and_track(context, update.message, SELECT_SHOW_CUSTOMERS, reply_markup=kb)
             elif next_key == 'where_from':
-                # Показать список адресов назначения для выбранного заказчику
-                # Явно зафиксируем, что текущий шаг создания — поле 'where', чтобы локальная
+                # Показать список адресов отправления для выбранного заказчика
+                # Явно зафиксируем, что текущий шаг создания — поле 'where_from', чтобы локальная
                 # кнопка 'control:create:prev' корректно вернула на предыдущий шаг (departure_time).
                 try:
                     for i, f in enumerate(self.fields):
-                        if f[0] == 'where':
+                        if f[0] == 'where_from':
                             context.user_data['control_room_create_step'] = i
                             break
                 except Exception:
@@ -2124,17 +2346,15 @@ class ControlRoom:
                     if kb:
                         await self._send_and_track(context, update.message, SELECT_ADDRESS_FROM, reply_markup=kb)
                     else:
-                        # Если привязанных адресов нет — предложим кнопку "Показать все", кнопку "Вставить из БД" и "Отмена"
-                        # В режиме создания заменяем глобальную кнопку "Назад" на локальную 'control:create:prev',
-                        # которая вернёт пользователя на предыдущий шаг создания (например, на выбор даты).
+                        # Если привязанных адресов нет — предложим кнопку 'Показать все' и 'Вставить из БД'
                         kb = InlineKeyboardMarkup([
-                            [InlineKeyboardButton(MESSAGES.BTN_BACK, callback_data='control:create:prev'), InlineKeyboardButton(MESSAGES.BTN_CANCEL, callback_data='control:refresh')]
+                            [InlineKeyboardButton(MESSAGES.BTN_INSERT_FROM_DB, callback_data=f'control:address_insert:from_member:отпр')],
                             [InlineKeyboardButton(MESSAGES.BTN_SHOW_ALL, callback_data=f'control:addresses:showall:отпр')],
                             [InlineKeyboardButton(MESSAGES.BTN_BACK, callback_data='control:create:prev'), InlineKeyboardButton(MESSAGES.BTN_CANCEL, callback_data='control:refresh')]
                         ])
                         await self._send_and_track(context, update.message, SELECT_ADDRESS_FROM_MANUAL, reply_markup=kb)
                 else:
-                    # Если заказчик не выбран — всё равно предложим кнопку "Показать все", кнопку "Вставить из БД" и "Отмена"
+                    # Если заказчик не выбран — всё равно предложим кнопку 'Показать все', кнопку 'Вставить из БД' и 'Отмена'
                     kb = InlineKeyboardMarkup([
                         [InlineKeyboardButton(MESSAGES.BTN_INSERT_FROM_DB, callback_data=f'control:address_insert:from_member:отпр')],
                         [InlineKeyboardButton(MESSAGES.BTN_SHOW_ALL, callback_data=f'control:addresses:showall:отпр')],
@@ -2224,7 +2444,208 @@ class ControlRoom:
                         dep_dt
                     )
                 )
+                # Получим id вставленной записи
+                try:
+                    new_id = cursor.lastrowid
+                except Exception:
+                    new_id = None
+
                 sent = await self._send_and_track(context, update.message, CREATED_SUCCESS)
+                # Отправим карточку заявки конкретному пользователю (личное сообщение)
+                try:
+                    # Попробуем загрузить сохранённую запись, чтобы сформировать полную карточку
+                    if new_id is not None:
+                        try:
+                            cursor.execute('SELECT id, date, where_from, departure_time, "where", arrival_time, customer, phone FROM chart WHERE id = ?', (new_id,))
+                            row_for_card = cursor.fetchone()
+                        except Exception:
+                            row_for_card = None
+                    else:
+                        row_for_card = None
+
+                    # Если не удалось получить запись — собрать карточку из data
+                    if row_for_card:
+                        # row: (id, date, where_from, departure_time, where, arrival_time, customer, phone)
+                        keys = ['date','where_from','departure_time','where','arrival_time','customer','phone']
+                        text_lines = []
+                        for k, val in zip(keys, row_for_card[1:]):
+                            label = self.FIELD_LABELS.get(k, k)
+                            display_val = val if val is not None else ''
+                            if k == 'date' and display_val:
+                                try:
+                                    from datetime import datetime
+                                    dt = datetime.strptime(display_val, '%Y-%m-%d')
+                                    display_val = dt.strftime('%d.%m.%Y')
+                                except Exception:
+                                    pass
+                            esc_label = escape_html(str(label))
+                            esc_val = escape_html(str(display_val))
+                            text_lines.append(f"{esc_label}: {esc_val}")
+                        card_text = '\n'.join(text_lines)
+                    else:
+                        # Фоллбэк: используем data словарь
+                        keys = ['date','where_from','departure_time','where','arrival_time','customer','phone']
+                        text_lines = []
+                        for k in keys:
+                            label = self.FIELD_LABELS.get(k, k)
+                            display_val = data.get(k, '') or ''
+                            if k == 'date' and display_val:
+                                try:
+                                    from datetime import datetime
+                                    dt = datetime.strptime(display_val, '%Y-%m-%d')
+                                    display_val = dt.strftime('%d.%m.%Y')
+                                except Exception:
+                                    pass
+                            esc_label = escape_html(str(label))
+                            esc_val = escape_html(str(display_val))
+                            text_lines.append(f"{esc_label}: {esc_val}")
+                        card_text = '\n'.join(text_lines)
+
+                    # Сформируем итоговый текст карточки (будет использован, если нет шаблона)
+                    final_text = '<b>Создана заявка:</b>\n' + card_text
+
+                    # Попробуем отправить по настроенному каналу уведомлений 'on_create_request'
+                    try:
+                        try:
+                            channel = notifications.get_channel_by_name('on_create_request')
+                        except Exception:
+                            channel = None
+                        if channel and channel.get('enabled'):
+                            # Подготовим values для шаблона
+                            try:
+                                values = {
+                                    'id': new_id,
+                                    'date': '' if not data.get('date') else (lambda d: (d.strftime('%d.%m.%Y') if hasattr(d, 'strftime') else d))( ( __import__('datetime').datetime.strptime(data.get('date'), '%Y-%m-%d') ) ) if data.get('date') else '',
+                                }
+                            except Exception:
+                                # fallback: raw date
+                                values = {'id': new_id, 'date': data.get('date', '')}
+                            # fill other keys
+                            for k in ('where_from','departure_time','where','arrival_time','customer','phone'):
+                                values[k] = data.get(k, '') or ''
+
+                            tpl = channel.get('template') or ''
+                            # render template safely using escape_html
+                            try:
+                                body = notifications.render_template_safe(tpl, values, escape_func=escape_html) if tpl else final_text
+                            except Exception:
+                                body = final_text
+
+                            targets = []
+                            try:
+                                targets = notifications.list_targets(channel['id'])
+                            except Exception:
+                                targets = []
+
+                            bot = getattr(context, 'bot', None)
+                            if bot is not None and targets:
+                                for t in targets:
+                                    try:
+                                        # chat_id stored as text, try int conversion
+                                        cid = int(t)
+                                    except Exception:
+                                        cid = t
+                                    try:
+                                        await bot.send_message(chat_id=cid, text=body, parse_mode='HTML')
+                                    except Exception:
+                                        try:
+                                            self.logger.exception(f'Не удалось отправить уведомление по каналу on_create_request на {t}')
+                                            await notify_admin(context, f'Не удалось отправить уведомление на {t}', traceback.format_exc())
+                                        except Exception:
+                                            pass
+                            else:
+                                # Если канал отсутствует/отключён или целей нет — попробуем простой фолбэк из config (вариант A)
+                                try:
+                                    bot = getattr(context, 'bot', None)
+                                    fallback_cid = getattr(Config, 'NOTIFY_TARGET_CHAT_ID', None)
+                                    if bot is not None and fallback_cid:
+                                        # Подготовим безопасный body на основе шаблона config или final_text
+                                        try:
+                                            values = {'id': new_id}
+                                            # Подготовим дату в формате DD.MM.YYYY
+                                            try:
+                                                if data.get('date'):
+                                                    values['date'] = __import__('datetime').datetime.strptime(data.get('date'), '%Y-%m-%d').strftime('%d.%m.%Y')
+                                                else:
+                                                    values['date'] = ''
+                                            except Exception:
+                                                values['date'] = data.get('date', '') or ''
+                                            for k in ('where_from','departure_time','where','arrival_time','customer','phone'):
+                                                values[k] = data.get(k, '') or ''
+                                        except Exception:
+                                            values = {'id': new_id, 'date': data.get('date', '')}
+                                        try:
+                                            tpl = getattr(Config, 'NOTIFY_TEMPLATE_ON_CREATE', '') or ''
+                                            if tpl:
+                                                try:
+                                                    body = notifications.render_template_safe(tpl, values, escape_func=escape_html)
+                                                except Exception:
+                                                    body = final_text
+                                            else:
+                                                body = final_text
+                                        except Exception:
+                                            body = final_text
+                                        try:
+                                            await bot.send_message(chat_id=fallback_cid, text=body, parse_mode='HTML')
+                                        except Exception:
+                                            try:
+                                                self.logger.exception(f'Не удалось отправить уведомление на Config.NOTIFY_TARGET_CHAT_ID={fallback_cid}')
+                                                await notify_admin(context, f'Не удалось отправить уведомление на {fallback_cid}', traceback.format_exc())
+                                            except Exception:
+                                                pass
+                                except Exception:
+                                    pass
+                        else:
+                            # Канал не найден или отключён — пробуем фолбэк из config (вариант A)
+                            try:
+                                bot = getattr(context, 'bot', None)
+                                fallback_cid = getattr(Config, 'NOTIFY_TARGET_CHAT_ID', None)
+                                if bot is not None and fallback_cid:
+                                    # Сформируем values и рендер шаблона из config при наличии
+                                    try:
+                                        values = {'id': new_id}
+                                        try:
+                                            if data.get('date'):
+                                                values['date'] = __import__('datetime').datetime.strptime(data.get('date'), '%Y-%m-%d').strftime('%d.%m.%Y')
+                                            else:
+                                                values['date'] = ''
+                                        except Exception:
+                                            values['date'] = data.get('date', '') or ''
+                                        for k in ('where_from','departure_time','where','arrival_time','customer','phone'):
+                                            values[k] = data.get(k, '') or ''
+                                    except Exception:
+                                        values = {'id': new_id, 'date': data.get('date', '')}
+                                    try:
+                                        tpl = getattr(Config, 'NOTIFY_TEMPLATE_ON_CREATE', '') or ''
+                                        if tpl:
+                                            try:
+                                                body = notifications.render_template_safe(tpl, values, escape_func=escape_html)
+                                            except Exception:
+                                                body = final_text
+                                        else:
+                                            body = final_text
+                                    except Exception:
+                                        body = final_text
+                                    try:
+                                        await bot.send_message(chat_id=fallback_cid, text=body, parse_mode='HTML')
+                                    except Exception:
+                                        try:
+                                            self.logger.exception(f'Не удалось отправить уведомление на Config.NOTIFY_TARGET_CHAT_ID={fallback_cid}')
+                                            await notify_admin(context, f'Не удалось отправить уведомление на {fallback_cid}', traceback.format_exc())
+                                        except Exception:
+                                            pass
+                            except Exception:
+                                pass
+                    except Exception:
+                        try:
+                            self.logger.exception('Ошибка при подготовке/отправке карточки заявки через notifications')
+                        except Exception:
+                            pass
+                except Exception:
+                    try:
+                        self.logger.exception('Ошибка при подготовке/отправке карточки заявки внешнему пользователю')
+                    except Exception:
+                        pass
                 # Удалить уведомление через 10 секунд (fire-and-forget задача)
                 try:
                     bot = getattr(context, 'bot', None)
@@ -2288,14 +2709,23 @@ class ControlRoom:
                 ])
                 await self._send_and_track(context, msg, SELECT_SHOW_CUSTOMERS, reply_markup=kb)
             elif next_key == 'where_from':
-                # Показать список адресов, привязанных к выбранному заказчику (если есть)
+                # Показать список адресов отправления, привязанных к выбранному заказчику (если есть)
+                # Явно зафиксируем, что текущий шаг создания — поле 'where_from', чтобы локальная
+                # кнопка 'control:create:prev' корректно вернула на предыдущий шаг (departure_time).
+                try:
+                    for i, f in enumerate(self.fields):
+                        if f[0] == 'where_from':
+                            context.user_data['control_room_create_step'] = i
+                            break
+                except Exception:
+                    pass
                 cust_id = context.user_data.get('control_room_create_customer_id')
                 if cust_id:
                     kb = self._build_addresses_markup(cust_id, include_show_all=True, for_create=True)
                     if kb:
                         await self._send_and_track(context, msg, SELECT_ADDRESS_FROM, reply_markup=kb)
                     else:
-                        # Если привязанных адресов нет — предложим показать все и кнопку 'Вставить из БД'
+                        # Если привязанных адресов нет — предложим кнопку 'Показать все' и 'Вставить из БД'
                         kb = InlineKeyboardMarkup([
                             [InlineKeyboardButton(MESSAGES.BTN_INSERT_FROM_DB, callback_data=f'control:address_insert:from_member:отпр')],
                             [InlineKeyboardButton(MESSAGES.BTN_SHOW_ALL, callback_data=f'control:addresses:showall:отпр')],
@@ -2304,6 +2734,7 @@ class ControlRoom:
                         await self._send_and_track(context, msg, SELECT_ADDRESS_FROM_MANUAL, reply_markup=kb)
                 else:
                     kb = InlineKeyboardMarkup([
+                        [InlineKeyboardButton(MESSAGES.BTN_INSERT_FROM_DB, callback_data=f'control:address_insert:from_member:отпр')],
                         [InlineKeyboardButton(MESSAGES.BTN_SHOW_ALL, callback_data=f'control:addresses:showall:отпр')],
                         [InlineKeyboardButton(MESSAGES.BTN_BACK, callback_data='control:create:prev'), InlineKeyboardButton(MESSAGES.BTN_CANCEL, callback_data='control:refresh')]
                     ])
@@ -2381,6 +2812,41 @@ class ControlRoom:
                 bot = getattr(context, 'bot', None)
                 if bot and getattr(sent, 'chat', None):
                     asyncio.create_task(self._delete_message_later(bot, sent.chat.id, sent.message_id, 10))
+            except Exception:
+                pass
+            # Variant A: если нет DB-канала/целей — отправляем на chat_id из config (если указан)
+            try:
+                bot = getattr(context, 'bot', None)
+                fallback_cid = getattr(Config, 'NOTIFY_TARGET_CHAT_ID', None)
+                if bot is not None and fallback_cid:
+                    # Сформируем простую карточку из data
+                    try:
+                        keys = ['date','where_from','departure_time','where','arrival_time','customer','phone']
+                        text_lines = []
+                        for k in keys:
+                            label = self.FIELD_LABELS.get(k, k)
+                            display_val = data.get(k, '') or ''
+                            if k == 'date' and display_val:
+                                try:
+                                    from datetime import datetime
+                                    dt = datetime.strptime(display_val, '%Y-%m-%d')
+                                    display_val = dt.strftime('%d.%m.%Y')
+                                except Exception:
+                                    pass
+                            esc_label = escape_html(str(label))
+                            esc_val = escape_html(str(display_val))
+                            text_lines.append(f"{esc_label}: {esc_val}")
+                        final_text = '<b>Создана заявка:</b>\n' + '\n'.join(text_lines)
+                        try:
+                            await bot.send_message(chat_id=fallback_cid, text=final_text, parse_mode='HTML')
+                        except Exception:
+                            try:
+                                self.logger.exception(f'Не удалось отправить уведомление на Config.NOTIFY_TARGET_CHAT_ID={fallback_cid}')
+                                await notify_admin(context, f'Не удалось отправить уведомление на {fallback_cid}', traceback.format_exc())
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
             except Exception:
                 pass
             # Очистим флаги создания

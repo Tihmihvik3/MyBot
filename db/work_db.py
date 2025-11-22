@@ -6,6 +6,7 @@ from utils.member_formatter import get_member_details_text
 from db.edit_db import EditDB
 from db.add_record import AddRecord
 from db.del_record import DelRecord
+from utils.admin_messenger import delete_tracked_messages
 
 class WorkDB:
     def __init__(self):
@@ -322,6 +323,40 @@ class WorkDB:
             try:
                 from db.edit_db import EditDB
                 edit_db = EditDB()
+                # Если пользователь выбрал одну из записей из результатов поиска — сразу перейти к редактированию
+                if data.startswith('editdb:selected:'):
+                    try:
+                        parts_sel = data.split(':')
+                        member_id = int(parts_sel[2]) if len(parts_sel) >= 3 else None
+                    except Exception:
+                        member_id = None
+                    if member_id is None:
+                        try:
+                            await query.message.reply_text(MESSAGES_ADMIN.INVALID_RECORD_ID)
+                        except Exception:
+                            pass
+                        return
+                    # Удалим трекнутые админские сообщения (включая сообщение с результатами поиска),
+                    # чтобы не оставлять старый список в чате, затем запустим edit flow
+                    try:
+                        await delete_tracked_messages(context, exclude_greeting=True)
+                    except Exception:
+                        try:
+                            self.logger.exception('handle_callback: failed to delete tracked messages before edit start')
+                        except Exception:
+                            pass
+                    try:
+                        # Сформируем fake update с message=query.message
+                        fake = type('F', (), {})()
+                        fake.message = query.message
+                        await edit_db.edit_member_by_id(fake, context, member_id)
+                    except Exception:
+                        try:
+                            self.logger.exception('handle_callback: failed to start edit flow from selected search result')
+                        except Exception:
+                            pass
+                    return
+
                 # Route editdb callbacks: field selection, input controls, or cancel
                 if data.startswith('editdb:field:'):
                     await edit_db.process_field_callback(update, context)
@@ -339,6 +374,149 @@ class WorkDB:
         # Обработка callback'ов для AddRecord (workdb:add:cancel / workdb:add:back)
         if kind == 'add' and len(parts) >= 3:
             action = parts[2]
+            # Новая обработка выбора по индексу для поля 'Пол': workdb:add:floor_idx:<i>
+            if action == 'floor_idx' and len(parts) >= 4:
+                try:
+                    try:
+                        idx = int(parts[3])
+                    except Exception:
+                        idx = None
+                    try:
+                        await query.message.delete()
+                    except Exception:
+                        pass
+                    vals = context.user_data.get('add_record_floor_values', []) or []
+                    value = None
+                    if idx is not None and 0 <= idx < len(vals):
+                        value = vals[idx]
+                    if value is None:
+                        return
+                    try:
+                        data = context.user_data.get('add_record_data', {}) or {}
+                        # Подставляем в ключ 'floor'
+                        data['floor'] = value
+                        context.user_data['add_record_data'] = data
+                    except Exception:
+                        pass
+                    try:
+                        from db.add_record import AddRecord
+                        ar = AddRecord()
+                        fake = type('F', (), {})()
+                        class M: pass
+                        m = M()
+                        m.text = value
+                        m.chat = query.message.chat if getattr(query, 'message', None) and getattr(query.message, 'chat', None) else None
+                        fake.message = m
+                        await ar.handle_add_step(fake, context)
+                    except Exception:
+                        try:
+                            self.logger.exception('handle_callback: failed to advance add_record after selecting floor by index')
+                        except Exception:
+                            pass
+                    return
+                except Exception:
+                    try:
+                        self.logger.exception('handle_callback: unexpected error handling add:floor_idx callback')
+                    except Exception:
+                        pass
+                    return
+
+            # Новая обработка выбора по индексу для общего поля 'Группа': workdb:add:group_idx:<i>
+            if action == 'group_idx' and len(parts) >= 4:
+                try:
+                    try:
+                        idx = int(parts[3])
+                    except Exception:
+                        idx = None
+                    try:
+                        await query.message.delete()
+                    except Exception:
+                        pass
+                    vals = context.user_data.get('add_record_group_values', []) or []
+                    value = None
+                    if idx is not None and 0 <= idx < len(vals):
+                        value = vals[idx]
+                    if value is None:
+                        return
+                    try:
+                        data = context.user_data.get('add_record_data', {}) or {}
+                        step = context.user_data.get('add_record_step', None)
+                        if step == 4:
+                            key = 'group_disability'
+                        elif step == 8:
+                            key = '`group`'
+                        else:
+                            key = '`group`'
+                        data[key] = value
+                        context.user_data['add_record_data'] = data
+                    except Exception:
+                        pass
+                    try:
+                        from db.add_record import AddRecord
+                        ar = AddRecord()
+                        fake = type('F', (), {})()
+                        class M: pass
+                        m = M()
+                        m.text = value
+                        m.chat = query.message.chat if getattr(query, 'message', None) and getattr(query.message, 'chat', None) else None
+                        fake.message = m
+                        await ar.handle_add_step(fake, context)
+                    except Exception:
+                        try:
+                            self.logger.exception('handle_callback: failed to advance add_record after selecting group by index')
+                        except Exception:
+                            pass
+                    return
+                except Exception:
+                    try:
+                        self.logger.exception('handle_callback: unexpected error handling add:group_idx callback')
+                    except Exception:
+                        pass
+                    return
+            # Специальная обработка выбора группы инвалидности: workdb:add:group:<encoded_value>
+            if action == 'group' and len(parts) >= 4:
+                try:
+                    encoded = parts[3]
+                    try:
+                        await query.message.delete()
+                    except Exception:
+                        pass
+                    # Декодируем значение и подставим его в данные карточки (старое поведение)
+                    try:
+                        from urllib.parse import unquote
+                        value = unquote(encoded)
+                    except Exception:
+                        value = encoded
+                    try:
+                        data = context.user_data.get('add_record_data', {}) or {}
+                        # По старой логике — записываем в ключ group_disability
+                        data['group_disability'] = value
+                        context.user_data['add_record_data'] = data
+                    except Exception:
+                        pass
+                    # Вызовем обработчик шага как будто пользователь ввёл текст
+                    try:
+                        from db.add_record import AddRecord
+                        ar = AddRecord()
+                        fake = type('F', (), {})()
+                        class M: pass
+                        m = M()
+                        m.text = value
+                        m.chat = query.message.chat if getattr(query, 'message', None) and getattr(query.message, 'chat', None) else None
+                        fake.message = m
+                        await ar.handle_add_step(fake, context)
+                    except Exception:
+                        try:
+                            self.logger.exception('handle_callback: failed to advance add_record after selecting group_disability')
+                        except Exception:
+                            pass
+                    return
+                except Exception:
+                    try:
+                        self.logger.exception('handle_callback: unexpected error handling add:group callback')
+                    except Exception:
+                        pass
+                    return
             # Отмена добавления — вернуть в админ-меню, удалить prompt
             if action == 'cancel':
                 try:
@@ -561,10 +739,16 @@ class WorkDB:
                             except Exception:
                                 pass
                             # удалим сообщение с деталями, если сохранено
+                            # удалить сообщения с деталями и с кнопками действий (если сохранены)
                             details_msg = context.user_data.pop('workdb_member_details_message', None)
+                            actions_msg = context.user_data.pop('workdb_member_actions_message', None)
                             try:
-                                if details_msg and isinstance(details_msg, (list, tuple)) and len(details_msg) >= 2:
-                                    await context.bot.delete_message(chat_id=details_msg[0], message_id=details_msg[1])
+                                for msg in (actions_msg, details_msg):
+                                    if msg and isinstance(msg, (list, tuple)) and len(msg) >= 2:
+                                        try:
+                                            await context.bot.delete_message(chat_id=msg[0], message_id=msg[1])
+                                        except Exception:
+                                            pass
                             except Exception:
                                 pass
                             # Обновим/покажем список заново

@@ -71,15 +71,32 @@ class EditDB:
                     context.user_data['editdb_selected_rowid'] = row[0]
                     await self.show_edit_menu(update, context)
                 else:
-                    msg = 'Результаты поиска:\n'
+                    # Формируем Inline-клавиатуру с результатами поиска
+                    from telegram import InlineKeyboardMarkup, InlineKeyboardButton
+                    buttons = []
                     for idx, row in enumerate(rows, 1):
-                        msg += f"{idx}. Фамилия: {row[1]} | Имя: {row[2]} | Отчество: {row[3]}\n"
-                    msg += MESSAGES_ADMIN.SEARCH_RESULTS_PROMPT
+                        text = f"{idx}. {row[1]} {row[2]} {row[3]}".strip()
+                        cb = f'editdb:selected:{row[0]}'
+                        buttons.append([InlineKeyboardButton(text, callback_data=cb)])
+                    # Добавим кнопку отмены
+                    buttons.append([InlineKeyboardButton(MESSAGES_ADMIN.BTN_CANCEL, callback_data='editdb:cancel')])
+                    kb = InlineKeyboardMarkup(buttons)
                     try:
-                        await send_and_track(context, update.message, msg)
+                        await send_and_track(context, update.message, MESSAGES_ADMIN.SEARCH_RESULTS_HEADER, reply_markup=kb)
                     except Exception:
-                        await update.message.reply_text(msg)
-                    context.user_data['editdb_awaiting_choice'] = True
+                        try:
+                            await update.message.reply_text(MESSAGES_ADMIN.SEARCH_RESULTS_HEADER, reply_markup=kb)
+                        except Exception:
+                            # fallback: отправим простым текстом
+                            msg = 'Результаты поиска:\n'
+                            for idx, row in enumerate(rows, 1):
+                                msg += f"{idx}. Фамилия: {row[1]} | Имя: {row[2]} | Отчество: {row[3]}\n"
+                            msg += MESSAGES_ADMIN.SEARCH_RESULTS_PROMPT
+                            await update.message.reply_text(msg)
+                    # Сохраним результаты для совместимости с текстовым вводом
+                    context.user_data['editdb_search_results'] = rows
+                    # Ожидание теперь будет приходить через callback'ы, сбросим флаг текстового выбора
+                    context.user_data.pop('editdb_awaiting_choice', None)
         except Exception as e:
             await update.message.reply_text(MESSAGES_ADMIN.ERROR_SEARCH.format(error=e))
         context.user_data['editdb_awaiting_surname'] = False
@@ -109,6 +126,18 @@ class EditDB:
         # Сохраним выбранный rowid в состоянии модуля
         try:
             context.user_data['editdb_selected_rowid'] = member_id
+        except Exception:
+            pass
+        # Очистим возможные флаги из других модулей (например, control_room), чтобы
+        # они не перехватывали дальнейшие текстовые вводы в процессе редактирования.
+        try:
+            # Удаляем все ключи, начинающиеся с 'control_room_' из user_data
+            keys_to_remove = [k for k in list(context.user_data.keys()) if k.startswith('control_room_')]
+            for k in keys_to_remove:
+                try:
+                    context.user_data.pop(k, None)
+                except Exception:
+                    pass
         except Exception:
             pass
         # Сразу показать меню редактирования (оно использует send_and_track)
@@ -491,10 +520,43 @@ class EditDB:
                     pass
         except Exception:
             pass
+        # Также удалим приглашение к вводу, если оно есть, и сбросим состояние editdb
+        try:
+            pm = context.user_data.pop('editdb_input_prompt_message', None)
+            if pm and isinstance(pm, (list, tuple)) and len(pm) >= 2:
+                try:
+                    await context.bot.delete_message(chat_id=pm[0], message_id=pm[1])
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # Очистим состояние модуля редактирования
+        try:
+            for k in ('editdb_awaiting_new_value', 'editdb_awaiting_field', 'editdb_waiting_text', 'editdb_selected_rowid', 'editdb_search_results', 'editdb_awaiting_surname'):
+                try:
+                    context.user_data.pop(k, None)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Уведомим пользователя и вернём в админ-меню
         try:
             await query.message.reply_text(MESSAGES_ADMIN.EDITING_CANCELLED)
         except Exception:
             pass
+        try:
+            # Возврат в меню администратора — используем локальный import, как в других модулях
+            from bot import admin_message
+            fake = type('F', (), {})()
+            fake.callback_query = query
+            fake.message = query.message
+            await admin_message(fake, context)
+        except Exception:
+            try:
+                logger.exception('handle_cancel_callback: failed to return to admin menu')
+            except Exception:
+                pass
 
     async def handle_continue_or_exit(self, update, context):
         text = update.message.text.strip()

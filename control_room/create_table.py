@@ -6,7 +6,8 @@ from typing import Optional
 import traceback
 import asyncio
 from admin_notify import notify_admin
-from control_room.messages import NO_REQUESTS, CREATE_INSTRUCTION
+from control_room.messages import NO_REQUESTS, CREATE_INSTRUCTION, BTN_CREATE
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 
 async def ensure_chart_table(db: Database, update, context, logger: logging.Logger) -> bool:
@@ -118,7 +119,14 @@ async def ensure_chart_table(db: Database, update, context, logger: logging.Logg
                 await msg.reply_text('Таблица "chart" не была обнаружена и была создана.')
                 # Создадим связанные таблицы addresses и customer_addresse, если их нет
                 _ensure_addresses_and_customer_tables(cursor, logger)
-                await msg.reply_text(f'{NO_REQUESTS} {CREATE_INSTRUCTION}')
+                # Покажем сообщение о пустом списке и inline-кнопку "Создать" (эквивалент ввода '0')
+                await msg.reply_text(NO_REQUESTS)
+                try:
+                    kb = InlineKeyboardMarkup([[InlineKeyboardButton(BTN_CREATE, callback_data='control:create')]])
+                    await msg.reply_text(BTN_CREATE, reply_markup=kb)
+                except Exception:
+                    # Фолбэк — одно текстовое сообщение с инструкцией
+                    await msg.reply_text(f'{NO_REQUESTS} {CREATE_INSTRUCTION}')
                 context.user_data['control_room_wait_create'] = True
                 return True
 
