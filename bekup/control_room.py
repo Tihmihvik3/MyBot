@@ -12,7 +12,7 @@ class ControlRoom:
         # Проверяем роль пользователя, аналогично admin_message
         verifier = VerificationID()
         role = await verifier.check_role(update, context)
-        if role not in ("admin", "super admin"):
+        if role not in ("admin", "super_admin"):
             await update.message.reply_text('Эта команда вам не доступна. Обратитесь к администратору бота.')
             return
 

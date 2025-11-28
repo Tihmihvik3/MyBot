@@ -1,5 +1,5 @@
 import logging
-from utils.admin_messenger import send_and_track, delete_tracked_messages
+from utils.admin_messenger import send_and_track, delete_tracked_messages, clear_tracked_before
 import messages_admin as MESSAGES_ADMIN
 
 logger = logging.getLogger(__name__)
@@ -10,13 +10,22 @@ class DelRecord:
         "surname", "name", "patronymic", "date_birth", "group_disability", "phone", "address", "area", "`group`", "help_number", "date_issue", "validity_period", "pension_number", "ticket_number", "date_entry", "floor"
     ]
 
+    @clear_tracked_before
     async def start_delete(self, update, context):
         # Удалим предыдущие админские сообщения перед началом удаления
         try:
-            await send_and_track(context, update.message, MESSAGES_ADMIN.SEARCH_ENTER_SURNAME)
+            # Добавим inline-кнопку Отмена, чтобы пользователь мог вернуться в админ-меню
+            from telegram import InlineKeyboardMarkup, InlineKeyboardButton
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton(MESSAGES_ADMIN.BTN_CANCEL, callback_data='search:cancel')]])
+            await send_and_track(context, update.message, MESSAGES_ADMIN.SEARCH_ENTER_SURNAME, reply_markup=kb)
         except Exception:
             logger.exception('start_delete: send_and_track failed; falling back')
-            await update.message.reply_text(MESSAGES_ADMIN.SEARCH_ENTER_SURNAME)
+            try:
+                from telegram import InlineKeyboardMarkup, InlineKeyboardButton
+                kb = InlineKeyboardMarkup([[InlineKeyboardButton(MESSAGES_ADMIN.BTN_CANCEL, callback_data='search:cancel')]])
+                await update.message.reply_text(MESSAGES_ADMIN.SEARCH_ENTER_SURNAME, reply_markup=kb)
+            except Exception:
+                await update.message.reply_text(MESSAGES_ADMIN.SEARCH_ENTER_SURNAME)
         context.user_data['delrecord_awaiting_surname'] = True
 
     async def handle_surname_search(self, update, context):
@@ -45,15 +54,36 @@ class DelRecord:
                         await update.message.reply_text(f"Найдена запись: Фамилия: {row[1]} | Имя: {row[2]} | Отчество: {row[3]}. " + MESSAGES_ADMIN.CONFIRM_YES_NO)
                     context.user_data['delrecord_awaiting_confirm'] = True
                 else:
-                    msg = 'Результаты поиска:\n'
-                    for idx, row in enumerate(rows, 1):
-                        msg += f"{idx}. Фамилия: {row[1]} | Имя: {row[2]} | Отчество: {row[3]}\n"
-                    msg += MESSAGES_ADMIN.SEARCH_RESULTS_PROMPT
+                    # Покажем результаты в виде Inline-кнопок (одна строка — одна кнопка)
                     try:
-                        await send_and_track(context, update.message, msg)
+                        from telegram import InlineKeyboardMarkup, InlineKeyboardButton
+                        buttons = []
+                        for idx, row in enumerate(rows, 1):
+                            text = f"{idx}. {row[1]} {row[2]} {row[3]}".strip()
+                            cb = f'delrec:selected:{row[0]}'
+                            buttons.append([InlineKeyboardButton(text, callback_data=cb)])
+                        # Кнопка Отмена — использовать общий callback 'search:cancel'
+                        buttons.append([InlineKeyboardButton(MESSAGES_ADMIN.BTN_CANCEL, callback_data='search:cancel')])
+                        kb = InlineKeyboardMarkup(buttons)
+                        sent = await send_and_track(context, update.message, MESSAGES_ADMIN.SEARCH_RESULTS_HEADER, reply_markup=kb)
+                        # Сохраним id сообщения с записями, чтобы можно было удалить при показе деталей/подтверждении
+                        try:
+                            if getattr(sent, 'chat', None):
+                                context.user_data['delrecord_entries_message'] = (sent.chat.id, sent.message_id)
+                        except Exception:
+                            pass
                     except Exception:
-                        await update.message.reply_text(msg)
-                    context.user_data['delrecord_awaiting_choice'] = True
+                        # Фоллбэк: отправим текстовый список если inline не поддерживается
+                        msg = 'Результаты поиска:\n'
+                        for idx, row in enumerate(rows, 1):
+                            msg += f"{idx}. Фамилия: {row[1]} | Имя: {row[2]} | Отчество: {row[3]}\n"
+                        msg += MESSAGES_ADMIN.SEARCH_RESULTS_PROMPT
+                        try:
+                            await send_and_track(context, update.message, msg)
+                        except Exception:
+                            await update.message.reply_text(msg)
+                    # Переключаемся на режим выбора через callback'ы (не через ввод числа)
+                    context.user_data['delrecord_awaiting_choice'] = False
         except Exception as e:
             await update.message.reply_text(f'Ошибка при поиске: {e}')
         context.user_data['delrecord_awaiting_surname'] = False
@@ -118,7 +148,7 @@ class DelRecord:
                 await update.message.reply_text(f'Ошибка при удалении: {e}')
                 context.user_data['delrecord_repeat_or_exit'] = True
         elif text == '2':
-            # При отказе удалить — уберём сообщение с подтверждением удаления, если оно есть
+            # При отказе удалить — убрать подтверждение и вернуть в админ-меню via cancel helper
             try:
                 conf = context.user_data.pop('delrec_confirm_message', None)
                 if conf and isinstance(conf, (list, tuple)) and len(conf) >= 2:
@@ -129,9 +159,13 @@ class DelRecord:
             except Exception:
                 pass
             try:
-                await send_and_track(context, update.message, MESSAGES_ADMIN.SEARCH_REPEAT_EXIT)
+                from utils.admin_messenger import cancel_and_return_to_admin
+                await cancel_and_return_to_admin(update, context)
             except Exception:
-                await update.message.reply_text(MESSAGES_ADMIN.SEARCH_REPEAT_EXIT)
+                try:
+                    logger.exception('handle_confirm: cancel_and_return_to_admin failed')
+                except Exception:
+                    pass
             context.user_data['delrecord_repeat_or_exit'] = True
         else:
             await update.message.reply_text(MESSAGES_ADMIN.REPEAT_OR_EXIT_PROMPT)
@@ -145,16 +179,20 @@ class DelRecord:
             await self.start_delete(update, context)
             context.user_data['delrecord_repeat_or_exit'] = False
         elif text == '2':
-            # Выход — вернуться к меню администратора
+            # Выход — вернуться к меню администратора через cancel helper
             try:
-                await send_and_track(context, update.message, MESSAGES_ADMIN.ADMIN_MAIN_MENU)
+                from utils.admin_messenger import cancel_and_return_to_admin
+                await cancel_and_return_to_admin(update, context)
             except Exception:
-                await update.message.reply_text(MESSAGES_ADMIN.ADMIN_MAIN_MENU)
+                try:
+                    logger.exception('handle_repeat_or_exit: cancel_and_return_to_admin failed')
+                except Exception:
+                    pass
             context.user_data['delrecord_repeat_or_exit'] = False
-            context.user_data['admin_mode'] = True
         else:
             await update.message.reply_text(MESSAGES_ADMIN.REPEAT_OR_EXIT_PROMPT)
 
+    @clear_tracked_before
     async def delete_member_by_id(self, update, context, member_id):
         """
         Начать удаление записи по id (вызов из callback'а).
@@ -270,11 +308,14 @@ class DelRecord:
         except Exception:
             return False
         return True
+    @clear_tracked_before
     async def process_state(self, update, context):
         """
         Универсальный обработчик состояния для DelRecord.
         Возвращает True, если модуль обработал текущее сообщение.
         """
+        # Decorated at definition time where this class is used by the bot. If called
+        # directly from dispatcher it will be wrapped via the decorator elsewhere.
         if context.user_data.get('delrecord_repeat_or_exit'):
             await self.handle_repeat_or_exit(update, context)
             return True

@@ -8,6 +8,41 @@ import messages_admin as MESSAGES_ADMIN
 import secrets
 
 from db import notifications as notifications
+from utils.admin_messenger import clear_tracked_before
+
+
+def _clear_interaction_state(context):
+    """Очистить пользовательские флаги/состояния, чтобы перейти в чистый режим (admin/control)."""
+    try:
+        # ключи/префиксы, которые обычно используются для хранения состояний
+        prefixes = (
+            'control_room_', 'searchrecords_', 'editdb_', 'workdb_', 'add_record', 'delrec_',
+            'awaiting_', 'member_details_id', 'admin_menu_message', 'admin_header_message',
+            'admin_sent_messages', 'control_menu_message', 'control_help_message', 'workdb_entries_message',
+            'workdb_pages_message', 'workdb_member_details_message', 'workdb_member_actions_message',
+            'editdb_menu_message', 'editdb_input_prompt_message'
+        )
+        for k in list(getattr(context, 'user_data', {}).keys()):
+            try:
+                for p in prefixes:
+                    if isinstance(k, str) and (k == p or k.startswith(p)):
+                        context.user_data.pop(k, None)
+                        break
+            except Exception:
+                pass
+        # очистим control_room_sent_messages в chat_data, если есть
+        try:
+            if hasattr(context, 'chat_data') and isinstance(context.chat_data, dict):
+                for k in list(context.chat_data.keys()):
+                    if isinstance(k, str) and k.startswith('control_room_'):
+                        context.chat_data.pop(k, None)
+        except Exception:
+            pass
+    except Exception:
+        try:
+            logging.exception('Failed to clear interaction state')
+        except Exception:
+            pass
 
 
 async def _delete_message_later(bot, chat_id: int, message_id: int, delay_seconds: int = 10):
@@ -26,18 +61,46 @@ async def get_user_id_message(update, context):
     user_id = update.message.from_user.id
     await update.message.reply_text(f"Ваш уникальный идентификатор Telegram: {user_id}")
 
-logging.basicConfig(filename='bot.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Configure root logger with explicit FileHandler using UTF-8 encoding so
+# Cyrillic in logs is preserved on Windows and other platforms.
+root_logger = logging.getLogger()
+if not root_logger.handlers:
+    root_logger.setLevel(logging.INFO)
+    fh = logging.FileHandler('bot.log', encoding='utf-8')
+    fmt = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    fh.setFormatter(fmt)
+    root_logger.addHandler(fh)
 
+# Диагностический лог при загрузке модуля bot.py — поможет понять, какой файл реально загружен в процессе
+try:
+    logging.info(f"bot module loaded from {__file__}")
+except Exception:
+    try:
+        logging.exception('bot: failed to log module path on load')
+    except Exception:
+        pass
+
+@clear_tracked_before
 async def start_command(update, context):
     # Ответ на команду /start с кнопками
     # Клавиатура (используется, когда нужно показать пользователю), но по умолчанию скрыта
     keyboard = [["Новости", "Фото"], ["Видео", "Контакты"], ["Справка", "ДП"]]
     # Inline-клавиатура приветствия: кнопка вызова Reply-клавиатуры (Menu), Справка
     # и дополнительная кнопка-открывашка для выпадающего inline-меню (dropdown).
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(MESSAGES_ADMIN.BTN_MENU, callback_data='menu:show'), InlineKeyboardButton(MESSAGES_ADMIN.BTN_HELP, callback_data='help:show')],
-        [InlineKeyboardButton(MESSAGES_ADMIN.BTN_MENU_TOGGLE, callback_data='dropdown:toggle')]
-    ])
+    # Показывать кнопку-открывашку "Меню ▾" только для super_admin
+    try:
+        from verification_id import VerificationID
+        verifier = VerificationID()
+        try:
+            role = await verifier.check_role(update, context)
+        except Exception:
+            role = None
+    except Exception:
+        role = None
+    rows = [[InlineKeyboardButton(MESSAGES_ADMIN.BTN_MENU, callback_data='menu:show'), InlineKeyboardButton(MESSAGES_ADMIN.BTN_HELP, callback_data='help:show')]]
+    if role == 'super_admin':
+        rows.append([InlineKeyboardButton(MESSAGES_ADMIN.BTN_MENU_TOGGLE, callback_data='dropdown:toggle')])
+    kb = InlineKeyboardMarkup(rows)
     # Используем message из Update (если есть)
     msg_obj = update.message if getattr(update, 'message', None) else (update.callback_query.message if getattr(update, 'callback_query', None) else None)
     greeting_text = "Добро пожаловать! Я бот Анжеро-Судженской МО ВОС. Чем могу помочь?"
@@ -56,15 +119,18 @@ async def start_command(update, context):
             except Exception:
                 logging.exception('Не удалось сохранить приветствие в chat_data')
 
+@clear_tracked_before
 async def greet_user(update, context):
     # Ответ на приветствие
     await update.message.reply_text("Здравствуйте! Вас приветствует бот Анжеро-Судженской МО ВОС!")
 
+@clear_tracked_before
 async def help_message(update, context):
     # Ответ на сообщение "справка"
     await update.message.reply_text("Справка: Этот бот может отвечать на команды и сообщения, такие как 'привет' и 'справка'.")
 
 
+@clear_tracked_before
 async def help_callback(update, context):
     # Обработчик для inline-кнопки Справка / Закрыть справку
     query = update.callback_query
@@ -108,6 +174,7 @@ async def help_callback(update, context):
         return
 
 
+@clear_tracked_before
 async def menu_callback(update, context):
     # Обработчик для inline-кнопки Меню бота / Закрыть меню
     query = update.callback_query
@@ -183,22 +250,25 @@ async def menu_callback(update, context):
         return
 
 
+@clear_tracked_before
 async def show_menu_command(update, context):
     # Показать главное меню (ReplyKeyboardMarkup)
     keyboard = [["Новости", "Фото"], ["Видео", "Контакты"], ["Справка", "ДП"]]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     await update.message.reply_text('Главное меню:', reply_markup=reply_markup)
 
+@clear_tracked_before
 async def contact_message(update, context):
     # Ответ на сообщение "контакты"
     await update.message.reply_text("Контакты: Вы можете связаться с нами по телефону +7 (38453) 6-18-85 или email amvos42@gmail.com.")
 
 
+@clear_tracked_before
 async def admin_token_cmd(update, context):
     from verification_id import VerificationID
     verifier = VerificationID()
     role = await verifier.check_role(update, context)
-    if role != 'super admin':
+    if role != 'super_admin':
         await update.message.reply_text('Доступ запрещён. Только super_admin может выполнять эту команду.')
         return
     token = secrets.token_urlsafe(24)
@@ -212,11 +282,12 @@ async def admin_token_cmd(update, context):
     await update.message.reply_text(f'Admin token сгенерирован:\n{token}\nСкопируйте и используйте для входа в панель администратора.')
 
 
+@clear_tracked_before
 async def notify_set_template_cmd(update, context):
     from verification_id import VerificationID
     verifier = VerificationID()
     role = await verifier.check_role(update, context)
-    if role != 'super admin':
+    if role != 'super_admin':
         await update.message.reply_text('Доступ запрещён.')
         return
     if not context.args or len(context.args) < 2:
@@ -232,11 +303,12 @@ async def notify_set_template_cmd(update, context):
         await update.message.reply_text(f'Ошибка при сохранении шаблона: {e}')
 
 
+@clear_tracked_before
 async def notify_add_target_cmd(update, context):
     from verification_id import VerificationID
     verifier = VerificationID()
     role = await verifier.check_role(update, context)
-    if role != 'super admin':
+    if role != 'super_admin':
         await update.message.reply_text('Доступ запрещён.')
         return
     if not context.args or len(context.args) < 2:
@@ -257,11 +329,12 @@ async def notify_add_target_cmd(update, context):
         await update.message.reply_text(f'Ошибка при добавлении получателя: {e}')
 
 
+@clear_tracked_before
 async def notify_list_cmd(update, context):
     from verification_id import VerificationID
     verifier = VerificationID()
     role = await verifier.check_role(update, context)
-    if role != 'super admin':
+    if role != 'super_admin':
         await update.message.reply_text('Доступ запрещён.')
         return
     try:
@@ -292,12 +365,23 @@ async def notify_list_cmd(update, context):
         logging.exception('notify_list failed')
         await update.message.reply_text(f'Ошибка: {e}')
 
+@clear_tracked_before
 async def admin_message(update, context):
     # Проверка роли пользователя через VerificationID
     from verification_id import VerificationID
     verifier = VerificationID()
     USER_ROLE = await verifier.check_role(update, context)
-    if USER_ROLE in ("admin", "super admin"):
+    # Перед вхождением в админ-режим очищаем все флаги взаимодействия,
+    # чтобы режимы не пересекались.
+    try:
+        _clear_interaction_state(context)
+    except Exception:
+        try:
+            logging.exception('Failed to clear interaction state when entering admin mode')
+        except Exception:
+            pass
+
+    if USER_ROLE in ("admin", "super_admin"):
         # Удаляем ранее отправленные служебные/админ-сообщения перед выводом нового меню,
         # кроме приветственного сообщения "Добро пожаловать...".
         try:
@@ -366,6 +450,7 @@ async def admin_message(update, context):
         await update.message.reply_text("Эта команда вам не доступна. Обратитесь к администратору бота.")
         context.user_data['admin_mode'] = False
 
+@clear_tracked_before
 async def admin_action_handler(update, context):
     """
     Обработчик выбора действия админа
@@ -421,16 +506,100 @@ async def admin_action_handler(update, context):
     if processed:
         return
     else:
-        # Если выбрано "2" — запуск поиска через SearchRecords
-        if update.message.text.strip() == '2':
+        # Если пользователь ввёл цифру 1..6 — имитируем нажатие соответствующей inline-кнопки
+        text_choice = update.message.text.strip()
+        # choice '1' -> показать отсортированный список (WorkDB.show_sorted_by_surname)
+        if text_choice == '1':
+            try:
+                from db.work_db import WorkDB as _WorkDB
+                _work = _WorkDB()
+                await _work.show_sorted_by_surname(update, context)
+            except Exception:
+                logging.exception('admin_action_handler: failed to handle textual choice 1')
+            return
+        # choice '2' -> поиск по фамилии (как в admin_callback: удаляем заголовок/меню перед стартом)
+        if text_choice == '2':
+            try:
+                hdr = context.user_data.pop('admin_header_message', None)
+                menu = context.user_data.pop('admin_menu_message', None)
+                for msg in (hdr, menu):
+                    if msg and isinstance(msg, (list, tuple)) and len(msg) >= 2:
+                        try:
+                            await context.bot.delete_message(chat_id=msg[0], message_id=msg[1])
+                        except Exception:
+                            pass
+            except Exception:
+                try:
+                    logging.exception('admin_action_handler: failed to cleanup admin header/menu before search')
+                except Exception:
+                    pass
             await search_records.start_search(update, context)
-        # Если выбрано "6" — запуск сортировки и фильтра
-        elif update.message.text.strip() == '6':
-            await sortfiltr.start(update, context)
-        # Прямой вход в диспетчерскую теперь обрабатывается отдельным handler'ом (control_entry)
-        else:
-                await work_db.handle_admin_action(update, context)
+            return
+        # choice '3' -> EditDB.search_and_show_fields (admin_callback deletes header/menu first)
+        if text_choice == '3':
+            try:
+                hdr = context.user_data.pop('admin_header_message', None)
+                menu = context.user_data.pop('admin_menu_message', None)
+                for msg in (hdr, menu):
+                    if msg and isinstance(msg, (list, tuple)) and len(msg) >= 2:
+                        try:
+                            await context.bot.delete_message(chat_id=msg[0], message_id=msg[1])
+                        except Exception:
+                            pass
+            except Exception:
+                try:
+                    logging.exception('admin_action_handler: failed to cleanup admin header/menu before edit')
+                except Exception:
+                    pass
+            try:
+                ed = EditDB()
+                await ed.search_and_show_fields(update, context)
+            except Exception:
+                logging.exception('admin_action_handler: failed to handle textual choice 3')
+            return
+        # choice '4' -> AddRecord.start_add
+        if text_choice == '4':
+            try:
+                ar = AddRecord()
+                await ar.start_add(update, context)
+            except Exception:
+                logging.exception('admin_action_handler: failed to handle textual choice 4')
+            return
+        # choice '5' -> DelRecord.start_delete
+        if text_choice == '5':
+            try:
+                # Перед запуском удаления удалим заголовок/меню администратора так же, как
+                # это делает маршрут при нажатии inline-кнопки (admin_callback)
+                try:
+                    hdr = context.user_data.pop('admin_header_message', None)
+                    menu = context.user_data.pop('admin_menu_message', None)
+                    for msg in (hdr, menu):
+                        if msg and isinstance(msg, (list, tuple)) and len(msg) >= 2:
+                            try:
+                                await context.bot.delete_message(chat_id=msg[0], message_id=msg[1])
+                            except Exception:
+                                pass
+                except Exception:
+                    try:
+                        logging.exception('admin_action_handler: failed to cleanup admin header/menu before delete (textual 5)')
+                    except Exception:
+                        pass
+                dr = DelRecord()
+                await dr.start_delete(update, context)
+            except Exception:
+                logging.exception('admin_action_handler: failed to handle textual choice 5')
+            return
+        # choice '6' -> SortAndFiltr.start
+        if text_choice == '6':
+            try:
+                await sortfiltr.start(update, context)
+            except Exception:
+                logging.exception('admin_action_handler: failed to handle textual choice 6')
+            return
+        # В противном случае — делегируем общему обработчику work_db
+        await work_db.handle_admin_action(update, context)
 
+@clear_tracked_before
 async def admin_callback(update, context):
     """
     Конвертируем CallbackQuery от inline-кнопок администратора (admin:1..6)
@@ -627,6 +796,21 @@ async def admin_callback(update, context):
         try:
             from db.del_record import DelRecord
             dr = DelRecord()
+            # перед запуском удаления — удалим заголовок/меню администратора, как делается для других быстрых путей
+            try:
+                hdr = context.user_data.pop('admin_header_message', None)
+                menu = context.user_data.pop('admin_menu_message', None)
+                for msg in (hdr, menu):
+                    if msg and isinstance(msg, (list, tuple)) and len(msg) >= 2:
+                        try:
+                            await context.bot.delete_message(chat_id=msg[0], message_id=msg[1])
+                        except Exception:
+                            pass
+            except Exception:
+                try:
+                    logging.exception('admin_callback: failed to cleanup admin header/menu before delete')
+                except Exception:
+                    pass
             if getattr(update, 'message', None):
                 await dr.start_delete(update, context)
             else:
@@ -725,6 +909,7 @@ async def admin_callback(update, context):
     return
 
 
+@clear_tracked_before
 async def dropdown_callback(update, context):
     """Обработчик для простого выпадающего inline-меню (открыть/закрыть и показ пунктов)."""
     query = update.callback_query
@@ -754,10 +939,20 @@ async def dropdown_callback(update, context):
 
     # Закрыть выпадающее меню — восстановить первоначальную клавиатуру
     if data == 'dropdown:close':
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(MESSAGES_ADMIN.BTN_MENU, callback_data='menu:show'), InlineKeyboardButton(MESSAGES_ADMIN.BTN_HELP, callback_data='help:show')],
-            [InlineKeyboardButton(MESSAGES_ADMIN.BTN_MENU_TOGGLE, callback_data='dropdown:toggle')]
-        ])
+        # При восстановлении меню — показываем кнопку-открывашку только super_admin
+        try:
+            from verification_id import VerificationID
+            verifier = VerificationID()
+            try:
+                role = await verifier.check_role(update, context)
+            except Exception:
+                role = None
+        except Exception:
+            role = None
+        rows = [[InlineKeyboardButton(MESSAGES_ADMIN.BTN_MENU, callback_data='menu:show'), InlineKeyboardButton(MESSAGES_ADMIN.BTN_HELP, callback_data='help:show')]]
+        if role == 'super_admin':
+            rows.append([InlineKeyboardButton(MESSAGES_ADMIN.BTN_MENU_TOGGLE, callback_data='dropdown:toggle')])
+        kb = InlineKeyboardMarkup(rows)
         try:
             # Попытка вернуть исходный текст приветствия (корректнее, если это сообщение-приветствие)
             await query.edit_message_text('Добро пожаловать! Я бот Анжеро-Судженской МО ВОС. Чем могу помочь?', reply_markup=kb)
@@ -769,6 +964,7 @@ async def dropdown_callback(update, context):
         return
 
 
+@clear_tracked_before
 async def inline_menu_callback(update, context):
     """Обработка выбора пункта из inline-выпадающего меню."""
     query = update.callback_query
@@ -820,6 +1016,7 @@ async def inline_menu_callback(update, context):
         return
     
 
+@clear_tracked_before
 async def search_callback(update, context):
     """Обработка inline-кнопок поиска (например, 'search:cancel').
 
@@ -832,51 +1029,79 @@ async def search_callback(update, context):
     except Exception:
         pass
 
-    # Удалим текущее сообщение (приглашение к вводу фамилии)
+    # Диагностика: логируем вход в обработчик поиска и текущее состояние user_data
     try:
-        await query.message.delete()
-    except Exception:
-        pass
-
-    # Очистим возможные состояния поиска из user_data
-    try:
-        context.user_data.pop('searchrecords_awaiting_surname', None)
-        context.user_data.pop('searchrecords_results', None)
-        context.user_data.pop('searchrecords_awaiting_choice', None)
-        context.user_data.pop('searchrecords_repeat_or_exit', None)
-    except Exception:
-        pass
-
-    # Показать админ-меню
-    try:
-        fake = type('F', (), {})()
-        fake.callback_query = query
-        fake.message = query.message
-        await admin_message(fake, context)
+        logging.info(f"search_callback entered; data={getattr(query,'data',None)!r} user_id={getattr(query.from_user,'id',None)} keys_before={list(getattr(context, 'user_data', {}).keys())}")
     except Exception:
         try:
-            logging.exception('search_callback: failed to return to admin menu')
+            logging.exception('search_callback: failed to log entry state')
+        except Exception:
+            pass
+
+    # Унифицированный cancel -> очистка состояний и возврат в админ-меню
+    try:
+        import importlib
+        try:
+            logging.info('search_callback: importing utils.admin_messenger')
+        except Exception:
+            pass
+        mod = importlib.import_module('utils.admin_messenger')
+        cancel_fn = getattr(mod, 'cancel_and_return_to_admin', None)
+        if cancel_fn:
+            try:
+                logging.info('search_callback: calling cancel_and_return_to_admin')
+                await cancel_fn(update, context)
+                try:
+                    logging.info(f"search_callback: finished cancel; keys_after={list(getattr(context, 'user_data', {}).keys())}")
+                except Exception:
+                    pass
+            except Exception:
+                try:
+                    logging.exception('search_callback: cancel_and_return_to_admin raised')
+                except Exception:
+                    pass
+        else:
+            try:
+                logging.error('search_callback: cancel_and_return_to_admin not found in utils.admin_messenger')
+            except Exception:
+                pass
+    except Exception:
+        try:
+            logging.exception('search_callback: cancel_and_return_to_admin failed')
         except Exception:
             pass
     return
 
 
 
+@clear_tracked_before
 async def control_entry(update, context):
     """Обработчик, который позволяет пользователю сразу набрать 'диспетчерская' и попасть в диспетчерскую после проверки роли."""
     from control_room.control_room import ControlRoom
     control = ControlRoom()
+    try:
+        # Очистим все взаимодействия/флаги перед входом в диспетчерскую
+        _clear_interaction_state(context)
+    except Exception:
+        try:
+            logging.exception('Failed to clear interaction state before entering control_room')
+        except Exception:
+            pass
     await control.start(update, context)
 
+@clear_tracked_before
 async def news_message(update, context):
     await update.message.reply_text("Новости: Здесь будут последние новости организации.")
 
+@clear_tracked_before
 async def photo_message(update, context):
     await update.message.reply_text("Фото: Здесь будут опубликованы фотографии мероприятий.")
 
+@clear_tracked_before
 async def video_message(update, context):
     await update.message.reply_text("Видео: Здесь будут опубликованы видеоматериалы.")
 
+@clear_tracked_before
 async def number_message(update, context):
     number = update.message.text.strip()
     await update.message.reply_text(f"Вы нажали кнопку: {number}")
@@ -951,6 +1176,40 @@ def main():
     application.add_handler(CallbackQueryHandler(workdb.handle_callback, pattern=r'^(workdb:|delrec:|editdb:)'))
 
     logging.info("Бот стартовал")
+
+    # Register daily birthday notifier jobs (09:10 local time)
+    try:
+        from zoneinfo import ZoneInfo
+        from datetime import time as _time
+        tz = ZoneInfo(getattr(settings, 'TIMEZONE', 'Europe/Moscow'))
+
+        async def _birthday_job(context):
+            # context.job.data expected to contain {'days': int}
+            days = None
+            try:
+                days = context.job.data.get('days') if context.job and getattr(context.job, 'data', None) else None
+            except Exception:
+                days = None
+            if days is None:
+                days = 0
+            try:
+                from db.notifications import send_birthday_notifications
+                sent = await send_birthday_notifications(context.bot, int(days))
+                logging.info(f"birthday_job(days={days}) attempted sends={sent}")
+            except Exception:
+                logging.exception('birthday_job failed')
+
+        # Register jobs only if job_queue is available on the application object
+        jq = getattr(application, 'job_queue', None)
+        if jq:
+            # at 09:10 send reminder for 3 days before
+            jq.run_daily(_birthday_job, time=_time(9, 10, tzinfo=tz), name='birthday_3d', data={'days': 3})
+            # at 09:10 send reminder on the birthday
+            jq.run_daily(_birthday_job, time=_time(9, 10, tzinfo=tz), name='birthday_0d', data={'days': 0})
+        else:
+            logging.warning('Job queue is not available on Application instance; skipping daily birthday jobs registration')
+    except Exception:
+        logging.exception('Failed to register birthday jobs')
 
     # Запускаем бота
     application.run_polling()

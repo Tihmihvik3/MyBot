@@ -2,6 +2,7 @@ config.py
 *.db
 members_vos.db
 settings.py
+ADMIN_COMMANDS.md
 *.log
 .vscode/
 .idea/

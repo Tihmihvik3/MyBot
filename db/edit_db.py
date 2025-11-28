@@ -1,7 +1,8 @@
 import logging
 import asyncio
-from utils.admin_messenger import send_and_track, delete_tracked_messages
+from utils.admin_messenger import send_and_track, delete_tracked_messages, clear_tracked_before
 import messages_admin as MESSAGES_ADMIN
+from utils.date_utils import parse_date_strict
 from telegram import InlineKeyboardMarkup, InlineKeyboardButton
 from utils.member_formatter import get_member_details_text
 
@@ -36,13 +37,21 @@ class EditDB:
         'floor': 'Пол',
     }
 
+    @clear_tracked_before
     async def search_and_show_fields(self, update, context):
         # Отправим приглашение через send_and_track (он удалит старые сообщения перед отправкой)
         try:
-            await send_and_track(context, update.message, MESSAGES_ADMIN.SEARCH_ENTER_SURNAME)
+            from telegram import InlineKeyboardMarkup, InlineKeyboardButton
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton(MESSAGES_ADMIN.BTN_CANCEL, callback_data='editdb:cancel')]])
+            await send_and_track(context, update.message, MESSAGES_ADMIN.SEARCH_ENTER_SURNAME, reply_markup=kb)
         except Exception:
             logger.exception('search_and_show_fields: send_and_track failed; falling back')
-            await update.message.reply_text(MESSAGES_ADMIN.SEARCH_ENTER_SURNAME)
+            try:
+                from telegram import InlineKeyboardMarkup, InlineKeyboardButton
+                kb = InlineKeyboardMarkup([[InlineKeyboardButton(MESSAGES_ADMIN.BTN_CANCEL, callback_data='editdb:cancel')]])
+                await update.message.reply_text(MESSAGES_ADMIN.SEARCH_ENTER_SURNAME, reply_markup=kb)
+            except Exception:
+                await update.message.reply_text(MESSAGES_ADMIN.SEARCH_ENTER_SURNAME)
         context.user_data['editdb_awaiting_surname'] = True
 
     async def handle_surname_search(self, update, context):
@@ -118,6 +127,7 @@ class EditDB:
         await self.show_edit_menu(update, context)
         context.user_data['editdb_awaiting_choice'] = False
 
+    @clear_tracked_before
     async def edit_member_by_id(self, update, context, member_id):
         """
         Начать редактирование конкретной записи по id (вызывается из callback'а).
@@ -134,6 +144,19 @@ class EditDB:
             # Удаляем все ключи, начинающиеся с 'control_room_' из user_data
             keys_to_remove = [k for k in list(context.user_data.keys()) if k.startswith('control_room_')]
             for k in keys_to_remove:
+                try:
+                    context.user_data.pop(k, None)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # Также очистим возможные состояния, оставшиеся от SearchRecords/WorkDB,
+        # чтобы текстовый ввод нового значения не был перехвачен модулем поиска.
+        try:
+            for k in ('searchrecords_repeat_or_exit', 'searchrecords_results', 'searchrecords_awaiting_choice',
+                      'searchrecords_awaiting_surname', 'workdb_member_details_message', 'workdb_member_actions_message',
+                      'workdb_entries_message', 'workdb_pages_message', 'workdb_list_active', 'awaiting_member_details_action',
+                      'member_details_id'):
                 try:
                     context.user_data.pop(k, None)
                 except Exception:
@@ -234,20 +257,65 @@ class EditDB:
         if not data:
             await update.message.reply_text('Нет данных для обновления.')
             return
+        # Сразу достанем параметры (чтобы их можно было использовать в сообщениях об ошибке)
+        field = data.get('field')
+        rowid = data.get('rowid')
+        field_name = data.get('field_name')
+
         # Перед уведомлением о сохранении используем send_and_track
-        new_value = update.message.text.strip()
-        field = data['field']
-        rowid = data['rowid']
-        field_name = data['field_name']
+        raw_input = update.message.text.strip()
+        # Если пользователь ввёл '-', считаем это командой очистить поле (NULL)
+        if raw_input == '-':
+            new_value = None
+        else:
+            new_value = raw_input
+            try:
+                # Для поля validity_period поддерживаем текст 'бессрочно' (без парсинга)
+                if field == 'validity_period':
+                    if isinstance(new_value, str) and new_value.strip().lower() == 'бессрочно':
+                        new_value = 'бессрочно'
+                    elif new_value.strip() == '':
+                        new_value = ''
+                    else:
+                        # Попытка распознать дату, как для других дат
+                        parsed = parse_date_strict(new_value)
+                        if not parsed:
+                            try:
+                                await update.message.reply_text(MESSAGES_ADMIN.INVALID_DATE_FORMAT)
+                            except Exception:
+                                pass
+                            try:
+                                await update.message.reply_text(MESSAGES_ADMIN.ENTER_NEW_VALUE_PROMPT.format(field_name=field_name))
+                            except Exception:
+                                pass
+                            return
+                        new_value = parsed
+                # Для обычных дат — как раньше
+                elif field in ('date_birth', 'date_issue', 'date_entry'):
+                    parsed = parse_date_strict(new_value)
+                    if not parsed:
+                        try:
+                            await update.message.reply_text(MESSAGES_ADMIN.INVALID_DATE_FORMAT)
+                        except Exception:
+                            pass
+                        try:
+                            await update.message.reply_text(MESSAGES_ADMIN.ENTER_NEW_VALUE_PROMPT.format(field_name=field_name))
+                        except Exception:
+                            pass
+                        return
+                    new_value = parsed
+            except Exception:
+                pass
         from db.database import Database
         db = Database()
         try:
             with db.get_cursor() as cursor:
-                # Очищаем ячейку (ставим пустое значение)
+                # Очищаем ячейку (ставим NULL по умолчанию)
                 cursor.execute(f'UPDATE members SET {field} = NULL WHERE rowid = ?', (rowid,))
-                # Вносим новое значение
-                cursor.execute(f'UPDATE members SET {field} = ? WHERE rowid = ?', (new_value, rowid))
-            # Перед уведомлением — удалим приглашение ввода, если оно было сохранено
+                # Вносим новое значение, если оно не None (если None — значит очистка)
+                if new_value is not None:
+                    cursor.execute(f'UPDATE members SET {field} = ? WHERE rowid = ?', (new_value, rowid))
+        # Перед уведомлением — удалим приглашение ввода, если оно было сохранено
             try:
                 pm = context.user_data.pop('editdb_input_prompt_message', None)
                 if pm and isinstance(pm, (list, tuple)) and len(pm) >= 2:
@@ -258,10 +326,28 @@ class EditDB:
             except Exception:
                 pass
 
+            # Удалим возможные предыдущие сообщения с деталями/кнопками/меню,
+            # чтобы перед отправкой новых деталей чат был чистым.
+            try:
+                for key in ('workdb_member_details_message', 'workdb_member_actions_message',
+                            'workdb_entries_message', 'workdb_pages_message',
+                            'editdb_menu_message', 'editdb_input_prompt_message',
+                            'admin_header_message', 'admin_menu_message'):
+                    m = context.user_data.pop(key, None)
+                    if m and isinstance(m, (list, tuple)) and len(m) >= 2:
+                        try:
+                            await context.bot.delete_message(chat_id=m[0], message_id=m[1])
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
             # Уведомим о сохранении и запланируем автоматическое удаление через 5 секунд
             sent_success = None
             try:
-                sent_success = await send_and_track(context, update.message, MESSAGES_ADMIN.SAVE_SUCCESS.format(field_name=field_name, new_value=new_value))
+                # Покажем в сообщении отображаемое значение (пустая строка вместо None)
+                display_value = new_value if new_value is not None else ''
+                sent_success = await send_and_track(context, update.message, MESSAGES_ADMIN.SAVE_SUCCESS.format(field_name=field_name, new_value=display_value))
             except Exception:
                 try:
                     sent_success = await update.message.reply_text(MESSAGES_ADMIN.SAVE_SUCCESS.format(field_name=field_name, new_value=new_value))
@@ -306,6 +392,8 @@ class EditDB:
                     pass
 
             try:
+                from telegram import InlineKeyboardMarkup, InlineKeyboardButton
+                # Стандартные кнопки действий: Редактировать, Удалить, Назад, Выход
                 kb = InlineKeyboardMarkup([
                     [InlineKeyboardButton(MESSAGES_ADMIN.BTN_EDIT, callback_data=f'workdb:detail:edit:{rowid}')],
                     [InlineKeyboardButton(MESSAGES_ADMIN.BTN_DELETE, callback_data=f'workdb:detail:delete:{rowid}')],
@@ -316,15 +404,32 @@ class EditDB:
                     context.user_data['workdb_member_actions_message'] = (sent_kb.chat.id, sent_kb.message_id)
                 except Exception:
                     pass
-            except Exception:
+            except Exception as e:
                 try:
-                    await update.message.reply_text(MESSAGES_ADMIN.MEMBER_DETAILS_ACTION_FALLBACK)
+                    logger.exception('handle_new_value: failed to send action keyboard')
                 except Exception:
                     pass
+                # Попробуем повторно отправить клавиатуру через bot.send_message (на случай, если reply_text не сработал)
+                try:
+                    chat_id = None
+                    if getattr(update, 'message', None) and getattr(update.message, 'chat', None):
+                        chat_id = update.message.chat.id
+                    elif getattr(update, 'callback_query', None) and getattr(update.callback_query.from_user, 'id', None):
+                        chat_id = update.callback_query.from_user.id
+                    if chat_id:
+                        await context.bot.send_message(chat_id=chat_id, text=MESSAGES_ADMIN.MEMBER_DETAILS_ACTION_PROMPT, reply_markup=kb)
+                    else:
+                        await update.message.reply_text(MESSAGES_ADMIN.MEMBER_DETAILS_ACTION_PROMPT)
+                except Exception:
+                    try:
+                        await update.message.reply_text(MESSAGES_ADMIN.MEMBER_DETAILS_ACTION_PROMPT)
+                    except Exception:
+                        pass
         except Exception as e:
             await update.message.reply_text(MESSAGES_ADMIN.ERROR_SELECT.format(error=e))
         context.user_data['editdb_awaiting_new_value'] = None
 
+    @clear_tracked_before
     async def process_field_callback(self, update, context):
         """
         Обработка нажатия на поле в Inline-клавиатуре выбора поля.
@@ -376,15 +481,54 @@ class EditDB:
         # Сохраняем ожидание нового значения
         context.user_data['editdb_awaiting_new_value'] = {'field': db_field, 'rowid': rowid, 'field_name': field_name}
 
-        # Попросим ввести новое значение (текстовое). Это единственная текстовая точка ввода.
-        # Отправить приглашение к вводу нового значения с inline-кнопками "Назад" и "Отмена"
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(MESSAGES_ADMIN.BTN_BACK, callback_data=f'editdb:input:back:{rowid}'), InlineKeyboardButton(MESSAGES_ADMIN.BTN_CANCEL, callback_data=f'editdb:input:cancel:{rowid}')]  
-        ])
+        # Попробуем получить текущее значение поля из базы и показать его перед приглашением
+        display_val = ''
         try:
-            sent_prompt = await query.message.reply_text(MESSAGES_ADMIN.ENTER_NEW_VALUE_PROMPT.format(field_name=field_name), reply_markup=kb)
+            from db.database import Database
+            db = Database()
+            with db.get_cursor() as cursor:
+                cursor.execute(f'SELECT {db_field} FROM members WHERE rowid = ?', (rowid,))
+                rr = cursor.fetchone()
+                if rr and len(rr) >= 1:
+                    display_val = rr[0] if rr[0] is not None else ''
+        except Exception:
+            display_val = ''
+
+        # Форматируем дату для отображения, если это поле даты
+        if display_val and 'Дата' in field_name:
             try:
-                # save prompt message id so it can be deleted when user enters the value
+                from datetime import datetime
+                dt = datetime.strptime(display_val, '%Y-%m-%d')
+                display_val = dt.strftime('%d.%m.%Y')
+            except Exception:
+                pass
+
+        # Подготовим клавиатуру для приглашения (включая Пропустить/Бессрочно для validity_period)
+
+        # Попросим ввести новое значение (текстовое). Это единственная текстовая точка ввода.
+        # Отправить приглашение к вводу нового значения с inline-кнопками "Назад" и "Отмена".
+        # Для поля validity_period добавим также кнопки Пропустить и Бессрочно.
+        try:
+            if db_field == 'validity_period':
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton('Пропустить', callback_data=f'editdb:input:skip:{rowid}'), InlineKeyboardButton('Бессрочно', callback_data=f'editdb:input:permanent:{rowid}')],
+                    [InlineKeyboardButton(MESSAGES_ADMIN.BTN_BACK, callback_data=f'editdb:input:back:{rowid}'), InlineKeyboardButton(MESSAGES_ADMIN.BTN_CANCEL, callback_data=f'editdb:input:cancel:{rowid}')]
+                ])
+            else:
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton(MESSAGES_ADMIN.BTN_BACK, callback_data=f'editdb:input:back:{rowid}'), InlineKeyboardButton(MESSAGES_ADMIN.BTN_CANCEL, callback_data=f'editdb:input:cancel:{rowid}')]
+                ])
+        except Exception:
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton(MESSAGES_ADMIN.BTN_BACK, callback_data=f'editdb:input:back:{rowid}'), InlineKeyboardButton(MESSAGES_ADMIN.BTN_CANCEL, callback_data=f'editdb:input:cancel:{rowid}')]
+            ])
+        # Отправляем единое сообщение: показываем текущее значение + приглашение к вводу в одном сообщении
+        try:
+            try:
+                sent_prompt = await send_and_track(context, query.message, MESSAGES_ADMIN.FIELD_CURRENT_PROMPT.format(field_name=field_name, display=display_val), reply_markup=kb)
+            except Exception:
+                sent_prompt = await query.message.reply_text(MESSAGES_ADMIN.FIELD_CURRENT_PROMPT.format(field_name=field_name, display=display_val), reply_markup=kb)
+            try:
                 context.user_data['editdb_input_prompt_message'] = (sent_prompt.chat.id, sent_prompt.message_id)
             except Exception:
                 pass
@@ -392,7 +536,11 @@ class EditDB:
             try:
                 user_id = getattr(query.from_user, 'id', None)
                 if user_id:
-                    await context.bot.send_message(chat_id=user_id, text=MESSAGES_ADMIN.ENTER_NEW_VALUE_PROMPT.format(field_name=field_name), reply_markup=kb)
+                    sent_prompt = await context.bot.send_message(chat_id=user_id, text=MESSAGES_ADMIN.FIELD_CURRENT_PROMPT.format(field_name=field_name, display=display_val), reply_markup=kb)
+                    try:
+                        context.user_data['editdb_input_prompt_message'] = (sent_prompt.chat.id, sent_prompt.message_id)
+                    except Exception:
+                        pass
             except Exception:
                 pass
         # Флаг, что ожидаем текстовый ввод
@@ -438,123 +586,111 @@ class EditDB:
                     pass
             return
 
-        # Если нажали "Отмена" — показать детали выбранной записи (обновлённые)
-        if action == 'cancel':
+        # Если нажали "Назад" — показать заново меню выбора поля
+        if action == 'back':
             try:
-                # удалим приглашение
+                # удалим текущее сообщение-приглашение с кнопками
                 try:
                     await query.message.delete()
                 except Exception:
                     pass
-                # member_id: если не передан, попробуем взять из состояния
-                mid = member_id or context.user_data.get('editdb_selected_rowid') or context.user_data.get('editdb_awaiting_new_value', {}).get('rowid') if context.user_data.get('editdb_awaiting_new_value') else None
-                if not mid:
-                    # ничего — вернём в админ-меню
-                    from bot import admin_message
-                    fake = type('F', (), {})()
-                    fake.message = query.message
-                    await admin_message(fake, context)
-                    return
-
-                # Показать детали записи (локальная реализация, подобная WorkDB.show_member_details)
-                # Reuse the common formatter which handles id/rowid
-                try:
-                    details = get_member_details_text(mid)
-                except Exception as e:
-                    details = MESSAGES_ADMIN.ERROR_SELECT.format(error=e)
-
-                # Отправим текст с деталями и inline-кнопки действий (редактировать/удалить/назад/выход)
-                try:
-                    sent_details = await query.message.reply_text(MESSAGES_ADMIN.MEMBER_DETAILS_HEADER + f"\n{details}")
-                    try:
-                        context.user_data['workdb_member_details_message'] = (sent_details.chat.id, sent_details.message_id)
-                    except Exception:
-                        pass
-                except Exception:
-                    try:
-                        await query.message.reply_text(MESSAGES_ADMIN.MEMBER_DETAILS_HEADER + f"\n{details}")
-                    except Exception:
-                        pass
-
-                # Кнопки действий — используем callback'ы workdb:detail:... чтобы обработать далее в WorkDB
-                try:
-                    kb = InlineKeyboardMarkup([
-                        [InlineKeyboardButton(MESSAGES_ADMIN.BTN_EDIT, callback_data=f'workdb:detail:edit:{mid}')],
-                        [InlineKeyboardButton(MESSAGES_ADMIN.BTN_DELETE, callback_data=f'workdb:detail:delete:{mid}')],
-                        [InlineKeyboardButton(MESSAGES_ADMIN.BTN_BACK, callback_data=f'workdb:detail:back:{mid}'), InlineKeyboardButton(MESSAGES_ADMIN.BTN_EXIT, callback_data=f'workdb:detail:exit')]
-                    ])
-                    sent_kb = await query.message.reply_text(MESSAGES_ADMIN.MEMBER_DETAILS_ACTION_PROMPT, reply_markup=kb)
-                    try:
-                        context.user_data['workdb_member_actions_message'] = (sent_kb.chat.id, sent_kb.message_id)
-                    except Exception:
-                        pass
-                except Exception:
-                    try:
-                        await query.message.reply_text(MESSAGES_ADMIN.MEMBER_DETAILS_ACTION_FALLBACK)
-                    except Exception:
-                        pass
-
-                # Установим состояние, что ожидаем действия над записью
-                context.user_data['member_details_id'] = mid
-                context.user_data['awaiting_member_details_action'] = True
+                # Показать меню полей
+                fake = type('F', (), {})()
+                fake.message = query.message
+                await self.show_edit_menu(fake, context)
             except Exception:
                 try:
-                    logger.exception('handle_input_callback: failed to show member details on cancel')
+                    logger.exception('handle_input_callback: failed to handle back')
                 except Exception:
                     pass
             return
 
-    async def handle_cancel_callback(self, update, context):
-        query = update.callback_query
-        try:
-            await query.answer()
-        except Exception:
-            pass
-        # Удалим меню
-        try:
-            menu_msg = context.user_data.pop('editdb_menu_message', None)
-            if menu_msg and isinstance(menu_msg, (list, tuple)) and len(menu_msg) >= 2:
+        # Если нажали "Пропустить" — эквивалент ввода '-' (очистить поле)
+        if action == 'skip':
+            try:
                 try:
-                    await context.bot.delete_message(chat_id=menu_msg[0], message_id=menu_msg[1])
+                    await query.message.delete()
                 except Exception:
                     pass
-        except Exception:
-            pass
-        # Также удалим приглашение к вводу, если оно есть, и сбросим состояние editdb
-        try:
-            pm = context.user_data.pop('editdb_input_prompt_message', None)
-            if pm and isinstance(pm, (list, tuple)) and len(pm) >= 2:
+                # Эмулируем ввод '-' и обработаем как новое значение
+                fake = type('F', (), {})()
+                class M: pass
+                m = M()
+                m.text = '-'
+                m.chat = query.message.chat if getattr(query, 'message', None) and getattr(query.message, 'chat', None) else None
+                # Provide a minimal reply_text wrapper so downstream code using update.message.reply_text works
+                async def _reply_text(text, reply_markup=None, **kwargs):
+                    try:
+                        cid = m.chat.id if getattr(m, 'chat', None) and getattr(m.chat, 'id', None) else None
+                        if cid is not None:
+                            return await context.bot.send_message(chat_id=cid, text=text, reply_markup=reply_markup, **{k: v for k, v in kwargs.items() if k != 'chat_id'})
+                    except Exception:
+                        pass
+                    return None
+                m.reply_text = _reply_text
+                fake.message = m
+                # Снимем флаг ожидания текста
+                context.user_data['editdb_waiting_text'] = False
+                await self.handle_new_value(fake, context)
+            except Exception:
                 try:
-                    await context.bot.delete_message(chat_id=pm[0], message_id=pm[1])
+                    logger.exception('handle_input_callback: failed to handle skip')
                 except Exception:
                     pass
-        except Exception:
-            pass
-        # Очистим состояние модуля редактирования
-        try:
-            for k in ('editdb_awaiting_new_value', 'editdb_awaiting_field', 'editdb_waiting_text', 'editdb_selected_rowid', 'editdb_search_results', 'editdb_awaiting_surname'):
-                try:
-                    context.user_data.pop(k, None)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+            return
 
-        # Уведомим пользователя и вернём в админ-меню
+        # Если нажали "Бессрочно" — вставляем текст 'бессрочно' и сохраняем (эмуляция ввода пользователем)
+        if action == 'permanent':
+            try:
+                try:
+                    await query.message.delete()
+                except Exception:
+                    pass
+                fake = type('F', (), {})()
+                class M: pass
+                m = M()
+                m.text = 'бессрочно'
+                m.chat = query.message.chat if getattr(query, 'message', None) and getattr(query.message, 'chat', None) else None
+                # Provide a minimal reply_text wrapper so downstream code using update.message.reply_text works
+                async def _reply_text(text, reply_markup=None, **kwargs):
+                    try:
+                        cid = m.chat.id if getattr(m, 'chat', None) and getattr(m.chat, 'id', None) else None
+                        if cid is not None:
+                            return await context.bot.send_message(chat_id=cid, text=text, reply_markup=reply_markup, **{k: v for k, v in kwargs.items() if k != 'chat_id'})
+                    except Exception:
+                        pass
+                    return None
+                m.reply_text = _reply_text
+                fake.message = m
+                context.user_data['editdb_waiting_text'] = False
+                await self.handle_new_value(fake, context)
+            except Exception:
+                try:
+                    logger.exception('handle_input_callback: failed to handle permanent')
+                except Exception:
+                    pass
+            return
+
+        # Если нажали "Отмена" — показать детали выбранной записи (обновлённые)
+        if action == 'cancel':
+            try:
+                from utils.admin_messenger import cancel_and_return_to_admin
+                await cancel_and_return_to_admin(update, context)
+            except Exception:
+                try:
+                    logger.exception('handle_input_callback: cancel_and_return_to_admin failed')
+                except Exception:
+                    pass
+            return
+
+    @clear_tracked_before
+    async def handle_cancel_callback(self, update, context):
         try:
-            await query.message.reply_text(MESSAGES_ADMIN.EDITING_CANCELLED)
-        except Exception:
-            pass
-        try:
-            # Возврат в меню администратора — используем локальный import, как в других модулях
-            from bot import admin_message
-            fake = type('F', (), {})()
-            fake.callback_query = query
-            fake.message = query.message
-            await admin_message(fake, context)
+            from utils.admin_messenger import cancel_and_return_to_admin
+            await cancel_and_return_to_admin(update, context)
         except Exception:
             try:
-                logger.exception('handle_cancel_callback: failed to return to admin menu')
+                logger.exception('handle_cancel_callback: cancel_and_return_to_admin failed')
             except Exception:
                 pass
 
@@ -565,13 +701,20 @@ class EditDB:
             await self.show_edit_menu(update, context)
             context.user_data['editdb_continue_or_exit'] = False
         elif text == '2':
-            # Выход — перейти к меню выбора действия администратора (WorkDB)
-            await update.message.reply_text(MESSAGES_ADMIN.ADMIN_MAIN_MENU)
+            # Выход — использовать centralized cancel helper (Exit == Cancel)
+            try:
+                from utils.admin_messenger import cancel_and_return_to_admin
+                await cancel_and_return_to_admin(update, context)
+            except Exception:
+                try:
+                    logger.exception('handle_continue_or_exit: cancel_and_return_to_admin failed')
+                except Exception:
+                    pass
             context.user_data['editdb_continue_or_exit'] = False
-            context.user_data['admin_mode'] = True
         else:
             await update.message.reply_text(MESSAGES_ADMIN.ENTER_1_OR_2)
 
+    @clear_tracked_before
     async def process_state(self, update, context):
         """
         Универсальная обработка состояний для EditDB.

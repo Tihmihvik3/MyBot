@@ -1,4 +1,3 @@
-from bot import admin_message
 import messages_admin as MESSAGES_ADMIN
 import logging
 from db.database import Database
@@ -6,7 +5,7 @@ from utils.member_formatter import get_member_details_text
 from db.edit_db import EditDB
 from db.add_record import AddRecord
 from db.del_record import DelRecord
-from utils.admin_messenger import delete_tracked_messages
+from utils.admin_messenger import delete_tracked_messages, clear_tracked_before, cancel_and_return_to_admin
 
 class WorkDB:
     def __init__(self):
@@ -16,6 +15,7 @@ class WorkDB:
         self.db = Database()
         self.logger = logging.getLogger(__name__)
 
+    @clear_tracked_before
     async def handle_admin_action(self, update, context):
         """
         Обрабатывает действия администратора, перенаправляет на соответствующий метод по выбору.
@@ -49,9 +49,14 @@ class WorkDB:
         """
         context.user_data['awaiting_member_detail_choice'] = False
         if text == '0':
-            await update.message.reply_text(MESSAGES_ADMIN.ADMIN_EXIT_TO_MENU)
-            
-            await admin_message(update, context)
+            # Use centralized cancel helper so Exit behaves the same as Cancel
+            try:
+                await cancel_and_return_to_admin(update, context)
+            except Exception:
+                try:
+                    self.logger.exception('_handle_member_detail_choice: cancel_and_return_to_admin failed')
+                except Exception:
+                    pass
             return
         try:
             idx = int(text)
@@ -299,6 +304,7 @@ class WorkDB:
         buttons.append([InlineKeyboardButton(MESSAGES_ADMIN.BTN_EXIT, callback_data='workdb:list:exit')])
         return InlineKeyboardMarkup(buttons)
 
+    @clear_tracked_before
     async def handle_callback(self, update, context):
         """Обработчик CallbackQuery для списка пользователей (workdb:...)
         Поддерживает:
@@ -421,6 +427,86 @@ class WorkDB:
                         pass
                     return
 
+            # Обработка нажатия "Пропустить" для текстовых полей (эмуляция ввода '-')
+            if action == 'skip' and len(parts) >= 4:
+                try:
+                    # удалим текущее callback-сообщение
+                    try:
+                        await query.message.delete()
+                    except Exception:
+                        pass
+                    # шаг, который нужно пропустить
+                    try:
+                        step_idx = int(parts[3])
+                    except Exception:
+                        step_idx = None
+                    # Эмулируем сообщение от пользователя с текстом '-'
+                    try:
+                        from db.add_record import AddRecord
+                        ar = AddRecord()
+                        fake = type('F', (), {})()
+                        class M: pass
+                        m = M()
+                        m.text = '-'
+                        m.chat = query.message.chat if getattr(query, 'message', None) and getattr(query.message, 'chat', None) else None
+                        fake.message = m
+                        # Убедимся, что context.user_data['add_record_step'] указывает на нужный шаг
+                        if step_idx is not None:
+                            context.user_data['add_record_step'] = step_idx
+                        await ar.handle_add_step(fake, context)
+                    except Exception:
+                        try:
+                            self.logger.exception('handle_callback: failed to process add:skip callback')
+                        except Exception:
+                            pass
+                    return
+                except Exception:
+                    try:
+                        self.logger.exception('handle_callback: unexpected error handling add:skip')
+                    except Exception:
+                        pass
+                    return
+
+            # Обработка нажатия "Бессрочно" для текстовых полей (вставляет значение 'бессрочно')
+            if action == 'permanent' and len(parts) >= 4:
+                try:
+                    # удалим текущее callback-сообщение
+                    try:
+                        await query.message.delete()
+                    except Exception:
+                        pass
+                    # шаг, который нужно обработать
+                    try:
+                        step_idx = int(parts[3])
+                    except Exception:
+                        step_idx = None
+                    # Эмулируем сообщение от пользователя с текстом 'бессрочно'
+                    try:
+                        from db.add_record import AddRecord
+                        ar = AddRecord()
+                        fake = type('F', (), {})()
+                        class M: pass
+                        m = M()
+                        m.text = 'бессрочно'
+                        m.chat = query.message.chat if getattr(query, 'message', None) and getattr(query.message, 'chat', None) else None
+                        fake.message = m
+                        # Убедимся, что context.user_data['add_record_step'] указывает на нужный шаг
+                        if step_idx is not None:
+                            context.user_data['add_record_step'] = step_idx
+                        await ar.handle_add_step(fake, context)
+                    except Exception:
+                        try:
+                            self.logger.exception('handle_callback: failed to process add:permanent callback')
+                        except Exception:
+                            pass
+                    return
+                except Exception:
+                    try:
+                        self.logger.exception('handle_callback: unexpected error handling add:permanent')
+                    except Exception:
+                        pass
+                    return
+
             # Новая обработка выбора по индексу для общего поля 'Группа': workdb:add:group_idx:<i>
             if action == 'group_idx' and len(parts) >= 4:
                 try:
@@ -520,42 +606,10 @@ class WorkDB:
             # Отмена добавления — вернуть в админ-меню, удалить prompt
             if action == 'cancel':
                 try:
-                    try:
-                        await query.message.delete()
-                    except Exception:
-                        pass
-                    # удалить сохранённый prompt, если есть
-                    try:
-                        prev = context.user_data.pop('add_record_prompt_message', None)
-                        if prev and isinstance(prev, (list, tuple)) and len(prev) >= 2:
-                            try:
-                                await context.bot.delete_message(chat_id=prev[0], message_id=prev[1])
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
-                    # удалить заголовок 'Заполнение карточки', если есть
-                    try:
-                        hdr = context.user_data.pop('add_record_header_message', None)
-                        if hdr and isinstance(hdr, (list, tuple)) and len(hdr) >= 2:
-                            try:
-                                await context.bot.delete_message(chat_id=hdr[0], message_id=hdr[1])
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
-                    # сбросим состояния add_record
-                    context.user_data.pop('add_record_in_progress', None)
-                    context.user_data.pop('add_record_step', None)
-                    context.user_data.pop('add_record_data', None)
-                    from bot import admin_message
-                    fake = type('F', (), {})()
-                    fake.callback_query = query
-                    fake.message = query.message
-                    await admin_message(fake, context)
+                    await cancel_and_return_to_admin(update, context)
                 except Exception:
                     try:
-                        self.logger.exception('handle_callback: failed to cancel add_record')
+                        self.logger.exception('handle_callback: cancel_and_return_to_admin failed for add:cancel')
                     except Exception:
                         pass
                 return
@@ -619,11 +673,16 @@ class WorkDB:
                                     pass
                         except Exception:
                             pass
-                        from bot import admin_message
-                        fake = type('F', (), {})()
-                        fake.callback_query = query
-                        fake.message = query.message
-                        await admin_message(fake, context)
+                        try:
+                            fake = type('F', (), {})()
+                            fake.callback_query = query
+                            fake.message = query.message
+                            await cancel_and_return_to_admin(fake, context)
+                        except Exception:
+                            try:
+                                self.logger.exception('handle_callback: failed to return to admin menu via cancel helper')
+                            except Exception:
+                                pass
                 except Exception:
                     try:
                         self.logger.exception('handle_callback: unexpected error handling add:back')
@@ -642,6 +701,21 @@ class WorkDB:
                         member_id = int(parts2[2])
                     except Exception:
                         member_id = None
+                    # Новая ветка: пользователь нажал кнопку выбора записи из списка (delrec:selected:<id>)
+                    if action in ('selected', 'select') and member_id is not None:
+                        try:
+                            # Делегируем показ подтверждения удаления в DelRecord.delete_member_by_id
+                            from db.del_record import DelRecord
+                            del_record = DelRecord()
+                            fake = type('F', (), {})()
+                            fake.message = query.message
+                            await del_record.delete_member_by_id(fake, context, member_id)
+                        except Exception:
+                            try:
+                                self.logger.exception('handle_callback: failed to start delete flow from selected search result (delrec:selected)')
+                            except Exception:
+                                pass
+                        return
                     # 'no' — просто удалить сообщение подтверждения
                     if action == 'no':
                         try:
@@ -766,12 +840,17 @@ class WorkDB:
                                 fake.message = query.message
                                 await self._send_user_list(fake, context, rows, page=page)
                             else:
-                                # если нет сохранённых rows — просто вернём в админ-меню
-                                from bot import admin_message
-                                fake = type('F', (), {})()
-                                fake.callback_query = query
-                                fake.message = query.message
-                                await admin_message(fake, context)
+                                # если нет сохранённых rows — просто вернём в админ-меню через cancel helper
+                                try:
+                                    fake = type('F', (), {})()
+                                    fake.callback_query = query
+                                    fake.message = query.message
+                                    await cancel_and_return_to_admin(fake, context)
+                                except Exception:
+                                    try:
+                                        self.logger.exception('delrec: failed to return to admin menu via cancel helper')
+                                    except Exception:
+                                        pass
                         except Exception:
                             try:
                                 self.logger.exception('delrec: failed during confirmation handling')
@@ -842,15 +921,22 @@ class WorkDB:
                 except Exception:
                     pass
                 try:
-                    from bot import admin_message
+                    # cleanup list specific messages first
+                    try:
+                        prev_entries = context.user_data.pop('workdb_entries_message', None)
+                        prev_pages = context.user_data.pop('workdb_pages_message', None)
+                        for msg in (prev_entries, prev_pages):
+                            if msg and isinstance(msg, (list, tuple)) and len(msg) >= 2:
+                                try:
+                                    await context.bot.delete_message(chat_id=msg[0], message_id=msg[1])
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
                     fake = type('F', (), {})()
-                    # Передаём и query, и message: VerificationID.check_role ожидает
-                    # либо update.callback_query (чтобы взять from_user), либо update.message
-                    # Если передать только message, check_role может ошибочно взять
-                    # wrong user (message.from_user) — поэтому передаём callback_query.
                     fake.callback_query = query
                     fake.message = query.message
-                    await admin_message(fake, context)
+                    await cancel_and_return_to_admin(fake, context)
                 except Exception:
                     try:
                         self.logger.exception('handle_callback: failed to return to admin menu after exit')
@@ -959,12 +1045,17 @@ class WorkDB:
                         fake.message = query.message
                         await self._send_user_list(fake, context, rows, page=page)
                     else:
-                        # Если данных нет, вернём пользователя в главное админ-меню
-                        from bot import admin_message
-                        fake = type('F', (), {})()
-                        fake.callback_query = query
-                        fake.message = query.message
-                        await admin_message(fake, context)
+                        # Если данных нет, вернём пользователя в главное админ-меню через cancel helper
+                        try:
+                            fake = type('F', (), {})()
+                            fake.callback_query = query
+                            fake.message = query.message
+                            await cancel_and_return_to_admin(fake, context)
+                        except Exception:
+                            try:
+                                self.logger.exception('handle_callback: failed to return to admin menu via cancel helper')
+                            except Exception:
+                                pass
                 except Exception:
                     try:
                         self.logger.exception('handle_callback: failed to return to list from detail back')
@@ -990,11 +1081,10 @@ class WorkDB:
                         await query.message.edit_reply_markup(reply_markup=None)
                     except Exception:
                         pass
-                    from bot import admin_message
                     fake = type('F', (), {})()
                     fake.callback_query = query
                     fake.message = query.message
-                    await admin_message(fake, context)
+                    await cancel_and_return_to_admin(fake, context)
                 except Exception:
                     try:
                         self.logger.exception('handle_callback: failed to return to admin menu from detail exit')
@@ -1023,6 +1113,7 @@ class WorkDB:
         'floor': 'Пол',
     }
 
+    @clear_tracked_before
     async def show_member_details(self, update, context, member_id):
         """
         Выводит подробные данные выбранной записи с пользовательскими названиями полей и предлагает действия над записью.
@@ -1082,9 +1173,31 @@ class WorkDB:
                             context.user_data['workdb_member_actions_message'] = (sent_kb.chat.id, sent_kb.message_id)
                         except Exception:
                             pass
-                    except Exception:
-                        # fallback к старому текстовому варианту
-                        await update.message.reply_text(MESSAGES_ADMIN.MEMBER_DETAILS_ACTION_FALLBACK)
+                    except Exception as e:
+                        try:
+                            self.logger.exception('show_member_details: failed to send action keyboard')
+                        except Exception:
+                            pass
+                        # Попробуем отправить клавиатуру через bot.send_message (с указанием chat_id)
+                        try:
+                            chat_id = None
+                            if getattr(update, 'message', None) and getattr(update.message, 'chat', None):
+                                chat_id = update.message.chat.id
+                            elif getattr(update, 'callback_query', None) and getattr(update.callback_query.from_user, 'id', None):
+                                chat_id = update.callback_query.from_user.id
+                            if chat_id:
+                                sent_kb = await context.bot.send_message(chat_id=chat_id, text=MESSAGES_ADMIN.MEMBER_DETAILS_ACTION_PROMPT, reply_markup=kb)
+                                try:
+                                    context.user_data['workdb_member_actions_message'] = (sent_kb.chat.id, sent_kb.message_id)
+                                except Exception:
+                                    pass
+                            else:
+                                await update.message.reply_text(MESSAGES_ADMIN.MEMBER_DETAILS_ACTION_PROMPT)
+                        except Exception:
+                            try:
+                                await update.message.reply_text(MESSAGES_ADMIN.MEMBER_DETAILS_ACTION_PROMPT)
+                            except Exception:
+                                pass
                     # Сохраняем id выбранной записи и ожидаем ввод действия
                     context.user_data['member_details_id'] = member_id
                     context.user_data['awaiting_member_details_action'] = True
@@ -1100,7 +1213,13 @@ class WorkDB:
         member_id = context.user_data.get('member_details_id')
         context.user_data['awaiting_member_details_action'] = False
         if text == '0':
-            await admin_message(update, context)
+            try:
+                await cancel_and_return_to_admin(update, context)
+            except Exception:
+                try:
+                    self.logger.exception('handle_member_details_action: cancel_and_return_to_admin failed')
+                except Exception:
+                    pass
             return
         elif text == '1':
             from db.edit_db import EditDB

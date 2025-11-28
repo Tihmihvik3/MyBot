@@ -98,3 +98,104 @@ def render_template_safe(template: str, values: Dict[str, str], escape_func=lamb
             esc = str(v)
         result = result.replace('{' + k + '}', esc)
     return result
+
+
+## Helpers for birthday notifications
+from datetime import date, timedelta, datetime
+def get_admin_telegram_ids() -> list:
+    """Return list of telegram_id (as strings) for members with admin roles.
+
+    NOTE: selection restricted to roles 'admin' and 'super_admin' (underscore) per requirements.
+    """
+    with _db.get_cursor() as cur:
+        cur.execute("""
+            SELECT DISTINCT telegram_id FROM members
+            WHERE (role = 'admin' OR role = 'super_admin') AND telegram_id IS NOT NULL
+        """)
+        rows = cur.fetchall()
+    return [r[0] for r in rows if r and r[0]]
+
+
+def get_birthdays_for_days_before(days_before: int) -> list:
+    """Return list of rows for members whose birthday falls in days_before days from today.
+
+    Each returned row is a dict with keys: id, surname, name, patronymic, group, phone, date_birth
+    date_birth is returned as stored in DB (ISO YYYY-MM-DD if available).
+    """
+    target = (date.today() + timedelta(days=days_before)).strftime('%m-%d')
+    with _db.get_cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, surname, name, patronymic, "group", phone, date_birth
+            FROM members
+            WHERE date_birth IS NOT NULL AND date_birth <> '' AND strftime('%m-%d', date_birth) = ?
+            ORDER BY date_birth ASC
+            """,
+            (target,)
+        )
+        rows = cur.fetchall()
+    results = []
+    for r in rows:
+        results.append({
+            'id': r[0],
+            'surname': r[1] or '',
+            'name': r[2] or '',
+            'patronymic': r[3] or '',
+            'group': r[4] or '',
+            'phone': r[5] or '',
+            'date_birth': r[6] or ''
+        })
+    return results
+
+
+def build_birthday_message(rows: list, days_before: int) -> str:
+    """Build human-readable message for given birthday rows and offset days_before."""
+    if not rows:
+        return ''
+    header = ''
+    if days_before == 0:
+        header = 'Сегодня дни рождения членов ВОС:'
+    else:
+        header = f'Напоминание: через {days_before} дня(ей) — дни рождения членов ВОС:'
+    lines = [header, '']
+    for i, r in enumerate(rows, start=1):
+        try:
+            db = r.get('date_birth')
+            dob = datetime.strptime(db, '%Y-%m-%d').strftime('%d.%m.%Y') if db else ''
+        except Exception:
+            dob = r.get('date_birth') or ''
+        fullname = ' '.join(p for p in (r.get('surname'), r.get('name'), r.get('patronymic')) if p).strip()
+        grp = r.get('group') or ''
+        phone = r.get('phone') or ''
+        lines.append(f"{i}) {dob} — {fullname} — Группа: {grp} — Тел: {phone}")
+    return '\n'.join(lines)
+
+
+async def send_birthday_notifications(bot, days_before: int) -> int:
+    """Async helper to send birthday notifications to all admin telegram ids.
+
+    Returns number of messages attempted (admins count) or 0 if nothing to send.
+    """
+    admins = get_admin_telegram_ids()
+    # include ADMIN_CHAT_ID from settings if configured
+    try:
+        import settings
+        admin_chat = getattr(settings, 'ADMIN_CHAT_ID', None)
+        if admin_chat:
+            # ensure included as string and avoid duplicates
+            if str(admin_chat) not in [str(a) for a in admins]:
+                admins.append(str(admin_chat))
+    except Exception:
+        pass
+    rows = get_birthdays_for_days_before(days_before)
+    if not rows or not admins:
+        return 0
+    text = build_birthday_message(rows, days_before)
+    sent = 0
+    for a in admins:
+        try:
+            await bot.send_message(chat_id=int(a), text=text)
+            sent += 1
+        except Exception:
+            logger.exception('Failed to send birthday notification to %s', a)
+    return sent

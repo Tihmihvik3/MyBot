@@ -1,5 +1,5 @@
 import logging
-from utils.admin_messenger import send_and_track, delete_tracked_messages
+from utils.admin_messenger import send_and_track, delete_tracked_messages, clear_tracked_before
 import messages_admin as MESSAGES_ADMIN
 
 logger = logging.getLogger(__name__)
@@ -10,6 +10,7 @@ class SearchRecords:
         "surname", "name", "patronymic", "date_birth", "group_disability", "phone", "address", "area", "`group`", "help_number", "date_issue", "validity_period", "pension_number", "ticket_number", "date_entry", "floor"
     ]
 
+    @clear_tracked_before
     async def start_search(self, update, context):
         # Отправим приглашение (send_and_track удалит старые сообщения перед отправкой)
         try:
@@ -57,9 +58,9 @@ class SearchRecords:
                         # fallback: показать простую карточку
                         await self.show_full_record(update, row)
                     try:
-                        await send_and_track(context, update.message, MESSAGES_ADMIN.SEARCH_REPEAT_EXIT)
+                        await send_and_track(context, update.message, MESSAGES_ADMIN.ENTER_1_OR_2)
                     except Exception:
-                        await update.message.reply_text(MESSAGES_ADMIN.SEARCH_REPEAT_EXIT)
+                        await update.message.reply_text(MESSAGES_ADMIN.ENTER_1_OR_2)
                     context.user_data['searchrecords_repeat_or_exit'] = True
                 else:
                     # Формируем Inline-клавиатуру с найденными записями
@@ -123,9 +124,9 @@ class SearchRecords:
         except Exception:
             await self.show_full_record(update, row)
         try:
-            await send_and_track(context, update.message, MESSAGES_ADMIN.SEARCH_REPEAT_EXIT)
+            await send_and_track(context, update.message, MESSAGES_ADMIN.ENTER_1_OR_2)
         except Exception:
-            await update.message.reply_text(MESSAGES_ADMIN.SEARCH_REPEAT_EXIT)
+            await update.message.reply_text(MESSAGES_ADMIN.ENTER_1_OR_2)
         context.user_data['searchrecords_awaiting_choice'] = False
         context.user_data['searchrecords_repeat_or_exit'] = True
 
@@ -135,9 +136,15 @@ class SearchRecords:
             await self.start_search(update, context)
             context.user_data['searchrecords_repeat_or_exit'] = False
         elif text == '2':
-            await update.message.reply_text(MESSAGES_ADMIN.ADMIN_MAIN_MENU)
+            try:
+                from utils.admin_messenger import cancel_and_return_to_admin
+                await cancel_and_return_to_admin(update, context)
+            except Exception:
+                try:
+                    logger.exception('handle_repeat_or_exit: cancel_and_return_to_admin failed')
+                except Exception:
+                    pass
             context.user_data['searchrecords_repeat_or_exit'] = False
-            context.user_data['admin_mode'] = True
         else:
             await update.message.reply_text(MESSAGES_ADMIN.ENTER_1_OR_2)
 
@@ -150,6 +157,7 @@ class SearchRecords:
             msg += f"{field}: {row[i+1]}\n"
         await update.message.reply_text(msg)
 
+    @clear_tracked_before
     async def process_state(self, update, context):
         """
         Универсальная обработка состояний для SearchRecords.

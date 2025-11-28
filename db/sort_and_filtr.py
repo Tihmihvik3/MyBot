@@ -9,6 +9,7 @@ import messages_admin as MESSAGES_ADMIN
 
 
 logger = logging.getLogger(__name__)
+from utils.admin_messenger import cancel_and_return_to_admin
 
 
 class SortAndFiltr:
@@ -88,10 +89,11 @@ class SortAndFiltr:
             await self.send_filter_field_keyboard(update, context)
             context.user_data['sortfiltr_awaiting_action'] = False
         elif context.user_data['sortfiltr_choice'] == '0':
-            # Выход из SortAndFiltr и возврат к admin_message
-            await update.message.reply_text(MESSAGES_ADMIN.ADMIN_EXIT_TO_MENU)
-            from bot import admin_message
-            await admin_message(update, context)
+            # Выход из SortAndFiltr — используем общий cancel helper
+            try:
+                await cancel_and_return_to_admin(update, context)
+            except Exception:
+                logger.exception('handle_action: cancel_and_return_to_admin failed')
             context.user_data['sortfiltr_awaiting_action'] = False
             context.user_data['sortfiltr_awaiting_sort_field'] = False
         else:
@@ -656,9 +658,15 @@ class SortAndFiltr:
             await self.start(update, context)
             return
         elif text == '2':
-            # Выход — вернуть в главное меню администратора
-            from bot import admin_message
-            await admin_message(update, context)
+            # Выход — вернуть в главное меню администратора через общий cancel helper
+            try:
+                from utils.admin_messenger import cancel_and_return_to_admin
+                await cancel_and_return_to_admin(update, context)
+            except Exception:
+                try:
+                    logger.exception('handle_repeat_or_exit: cancel_and_return_to_admin failed')
+                except Exception:
+                    pass
             return
 
     async def handle_callback(self, update, context):
@@ -678,8 +686,14 @@ class SortAndFiltr:
         if action == 'filter':
             # arg может быть 'cancel' или имя поля, либо служебные команды
             if arg == 'cancel':
-                await query.message.edit_text(MESSAGES_ADMIN.CANCELLED)
-                await self.start(update, context)
+                try:
+                    from utils.admin_messenger import cancel_and_return_to_admin
+                    await cancel_and_return_to_admin(update, context)
+                except Exception:
+                    try:
+                        logger.exception('sort_and_filtr: cancel_and_return_to_admin failed')
+                    except Exception:
+                        pass
                 return
             if arg == 'apply':
                 # Применить накопленные фильтры
@@ -838,11 +852,7 @@ class SortAndFiltr:
                 try:
                     # удалить все старые сообщения списка/навигации прежде чем вернуть в админ-меню
                     await self._cleanup_list_messages(context, delete_trigger_message=query.message)
-                    from bot import admin_message
-                    fake = type('F', (), {})()
-                    fake.callback_query = query
-                    fake.message = query.message
-                    await admin_message(fake, context)
+                    await cancel_and_return_to_admin(update, context)
                 except Exception:
                     try:
                         logger.exception('handle_callback: failed to handle action:exit')
@@ -925,11 +935,7 @@ class SortAndFiltr:
                 # Завершение — удалить все старые сообщения списка/навигации/текущий и вернуть в админ-меню
                 try:
                     await self._cleanup_list_messages(context, delete_trigger_message=query.message)
-                    from bot import admin_message
-                    fake = type('F', (), {})()
-                    fake.callback_query = query
-                    fake.message = query.message
-                    await admin_message(fake, context)
+                    await cancel_and_return_to_admin(update, context)
                 except Exception:
                     try:
                         logger.exception('handle_callback: failed to handle page:exit')
@@ -1062,11 +1068,7 @@ class SortAndFiltr:
                         await query.message.delete()
                     except Exception:
                         pass
-                    from bot import admin_message
-                    fake = type('F', (), {})()
-                    fake.callback_query = query
-                    fake.message = query.message
-                    await admin_message(fake, context)
+                    await cancel_and_return_to_admin(update, context)
                 except Exception:
                     try:
                         logger.exception('handle_callback: failed to handle sort:exit')

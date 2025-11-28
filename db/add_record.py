@@ -1,6 +1,8 @@
 import logging
-from utils.admin_messenger import send_and_track, delete_tracked_messages
+from utils.admin_messenger import send_and_track, delete_tracked_messages, clear_tracked_before
 import messages_admin as MESSAGES_ADMIN
+from utils.date_utils import parse_date_strict
+
 
 logger = logging.getLogger(__name__)
 
@@ -13,6 +15,7 @@ class AddRecord:
         "surname", "name", "patronymic", "date_birth", "group_disability", "phone", "address", "area", "`group`", "help_number", "date_issue", "validity_period", "pension_number", "ticket_number", "date_entry", "floor"
     ]
 
+    @clear_tracked_before
     async def start_add(self, update, context):
         # Отправим приглашение через send_and_track (он удалит старые admin-сообщения)
         context.user_data['add_record_data'] = {}
@@ -62,6 +65,7 @@ class AddRecord:
                 except Exception:
                     pass
         context.user_data['add_record_in_progress'] = True
+
 
     def _build_kb(self, step: int):
         from telegram import InlineKeyboardMarkup, InlineKeyboardButton
@@ -169,6 +173,39 @@ class AddRecord:
                 sent = await send_and_track(context, update.message, text, reply_markup=kb)
             else:
                 # Используем обычный reply_text, чтобы не удалять admin history на каждом шаге
+                # Если для данного шага допустимо "Пропустить", добавим inline-кнопку
+                try:
+                    # Шаги, для которых показываем кнопку "Пропустить" и/или "Бессрочно"
+                    SKIP_STEPS = (9, 10, 11, 12, 13)  # include validity_period (index 11)
+                    if step in SKIP_STEPS:
+                        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+                        try:
+                            existing = kb.inline_keyboard if hasattr(kb, 'inline_keyboard') else None
+                        except Exception:
+                            existing = None
+                        # Для шага с индексом 11 (Срок действия справки МСЭ) добавим кнопку "Бессрочно"
+                        if step == 11:
+                            skip_row = [
+                                InlineKeyboardButton('Пропустить', callback_data=f'workdb:add:skip:{step}'),
+                                InlineKeyboardButton('Бессрочно', callback_data=f'workdb:add:permanent:{step}')
+                            ]
+                        else:
+                            skip_row = [InlineKeyboardButton('Пропустить', callback_data=f'workdb:add:skip:{step}')]
+                        if existing is None:
+                            # Построим новую клавиатуру с кнопкой(ами) Пропустить/Бессрочно и строкой Назад/Отмена
+                            row = []
+                            if step >= 1:
+                                row.append(InlineKeyboardButton(MESSAGES_ADMIN.BTN_BACK, callback_data='workdb:add:back'))
+                            row.append(InlineKeyboardButton(MESSAGES_ADMIN.BTN_CANCEL, callback_data='workdb:add:cancel'))
+                            buttons = [skip_row, row]
+                            kb = InlineKeyboardMarkup(buttons)
+                        else:
+                            # Вставим кнопку(ы) Пропустить/Бессрочно сверху
+                            new_buttons = [skip_row] + list(existing)
+                            kb = InlineKeyboardMarkup(new_buttons)
+                except Exception:
+                    # не критично — продолжим без кнопки
+                    pass
                 sent = await update.message.reply_text(text, reply_markup=kb)
             if getattr(sent, 'chat', None):
                 context.user_data['add_record_prompt_message'] = (sent.chat.id, sent.message_id)
@@ -190,6 +227,85 @@ class AddRecord:
         step = context.user_data.get('add_record_step', 0)
         data = context.user_data.get('add_record_data', {})
         value = update.message.text.strip()
+        # If user enters '-' treat it as explicit empty (skip field)
+        if value == '-':
+            value = ''
+        # Validate/Normalize Date of Birth when entering in supported formats.
+        if step == 3:  # index of 'Дата рождения' in self.fields
+            # allow empty value (user chose to skip the date)
+            if value != '':
+                parsed = parse_date_strict(value)
+                if not parsed:
+                    # Ask user to re-enter date in correct format and do not advance step
+                    try:
+                        await update.message.reply_text(MESSAGES_ADMIN.INVALID_DATE_FORMAT)
+                    except Exception:
+                        try:
+                            await update.message.reply_text(MESSAGES_ADMIN.ENTER_FIELD_TEMPLATE.format(field='Дата рождения'))
+                        except Exception:
+                            pass
+                    # re-ask the same step prompt
+                    await self.ask_step(update, context, step)
+                    return
+                value = parsed
+        # Validate/Normalize Date Issue (Дата выдачи справки МСЭ)
+        if step == 10:  # index of 'Дата выдачи справки МСЭ' in self.fields
+            # allow skipping this date by entering '-'
+            if value != '':
+                parsed = parse_date_strict(value)
+                if not parsed:
+                    try:
+                        await update.message.reply_text(MESSAGES_ADMIN.INVALID_DATE_FORMAT)
+                    except Exception:
+                        try:
+                            await update.message.reply_text(MESSAGES_ADMIN.ENTER_FIELD_TEMPLATE.format(field='Дата выдачи справки МСЭ'))
+                        except Exception:
+                            pass
+                    await self.ask_step(update, context, step)
+                    return
+                value = parsed
+            else:
+                value = ''
+        # Validate/Normalize Validity Period (Срок действия справки МСЭ)
+        if step == 11:  # index of 'Срок действия справки МСЭ' in self.fields
+            # allow skipping this field by entering '-' or entering 'бессрочно'
+            if value != '':
+                if value.strip().lower() == 'бессрочно':
+                    # store literal 'бессрочно'
+                    value = 'бессрочно'
+                else:
+                    parsed = parse_date_strict(value)
+                    if not parsed:
+                        try:
+                            await update.message.reply_text(MESSAGES_ADMIN.INVALID_DATE_FORMAT)
+                        except Exception:
+                            try:
+                                await update.message.reply_text(MESSAGES_ADMIN.ENTER_FIELD_TEMPLATE.format(field='Срок действия справки МСЭ'))
+                            except Exception:
+                                pass
+                        await self.ask_step(update, context, step)
+                        return
+                    value = parsed
+            else:
+                value = ''
+        # Validate/Normalize Date Entry (Дата вступления) — make it behave like Date of Birth
+        if step == 14:  # index of 'Дата вступления' in self.fields
+            # allow empty value (user chose to skip the date)
+            if value != '':
+                parsed = parse_date_strict(value)
+                if not parsed:
+                    # Ask user to re-enter date in correct format and do not advance step
+                    try:
+                        await update.message.reply_text(MESSAGES_ADMIN.INVALID_DATE_FORMAT)
+                    except Exception:
+                        try:
+                            await update.message.reply_text(MESSAGES_ADMIN.ENTER_FIELD_TEMPLATE.format(field='Дата вступления'))
+                        except Exception:
+                            pass
+                    # re-ask the same step prompt
+                    await self.ask_step(update, context, step)
+                    return
+                value = parsed
         data[self.db_fields[step]] = value
         context.user_data['add_record_data'] = data
         step += 1
@@ -245,11 +361,17 @@ class AddRecord:
                 msg = MESSAGES_ADMIN.MEMBER_DETAILS_HEADER + '\n'
                 for i, field in enumerate(self.fields):
                     msg += f"{field}: {data.get(self.db_fields[i], '')}\n"
-                try:
-                    sent = await send_and_track(context, update.message, msg)
-                except Exception:
+                sent = await send_and_track(context, update.message, msg)
+                if not sent:
+                    # send_and_track failed — send via bot using detected chat_id
                     try:
-                        sent = await update.message.reply_text(msg)
+                        chat_id = None
+                        if getattr(update, 'message', None) and getattr(update.message, 'chat', None):
+                            chat_id = update.message.chat.id
+                        elif getattr(update, 'callback_query', None) and getattr(update.callback_query.from_user, 'id', None):
+                            chat_id = update.callback_query.from_user.id
+                        if chat_id:
+                            sent = await context.bot.send_message(chat_id=chat_id, text=msg)
                     except Exception:
                         sent = None
                 # Сохраним id сообщения с деталями для возможного удаления
@@ -267,14 +389,28 @@ class AddRecord:
                         [InlineKeyboardButton(MESSAGES_ADMIN.BTN_DELETE, callback_data=f'workdb:detail:delete:{inserted_id}')],
                         [InlineKeyboardButton(MESSAGES_ADMIN.BTN_BACK, callback_data=f'workdb:detail:back:{inserted_id}'), InlineKeyboardButton(MESSAGES_ADMIN.BTN_EXIT, callback_data=f'workdb:detail:exit')]
                     ])
-                    sent_kb = await update.message.reply_text(MESSAGES_ADMIN.MEMBER_DETAILS_ACTION_PROMPT, reply_markup=kb)
+                    sent_kb = None
                     try:
-                        context.user_data['workdb_member_actions_message'] = (sent_kb.chat.id, sent_kb.message_id)
+                        chat_id = None
+                        if getattr(update, 'message', None) and getattr(update.message, 'chat', None):
+                            chat_id = update.message.chat.id
+                        elif getattr(update, 'callback_query', None) and getattr(update.callback_query.from_user, 'id', None):
+                            chat_id = update.callback_query.from_user.id
+                        if chat_id:
+                            sent_kb = await context.bot.send_message(chat_id=chat_id, text=MESSAGES_ADMIN.MEMBER_DETAILS_ACTION_PROMPT, reply_markup=kb)
+                    except Exception:
+                        try:
+                            logger.exception('handle_add_step: failed to send action keyboard for new record')
+                        except Exception:
+                            pass
+                    try:
+                        if sent_kb and getattr(sent_kb, 'chat', None):
+                            context.user_data['workdb_member_actions_message'] = (sent_kb.chat.id, sent_kb.message_id)
                     except Exception:
                         pass
                 except Exception:
                     try:
-                        await update.message.reply_text(MESSAGES_ADMIN.MEMBER_DETAILS_ACTION_FALLBACK)
+                        logger.exception('handle_add_step: unexpected error while sending action keyboard')
                     except Exception:
                         pass
 
@@ -321,12 +457,19 @@ class AddRecord:
                         pass
             except Exception:
                 pass
-            await update.message.reply_text(MESSAGES_ADMIN.ADMIN_MAIN_MENU)
+            try:
+                from utils.admin_messenger import cancel_and_return_to_admin
+                await cancel_and_return_to_admin(update, context)
+            except Exception:
+                try:
+                    logger.exception('handle_continue_or_exit: cancel_and_return_to_admin failed')
+                except Exception:
+                    pass
             context.user_data['add_record_continue_or_exit'] = False
-            context.user_data['admin_mode'] = True
         else:
             await update.message.reply_text(MESSAGES_ADMIN.ENTER_1_OR_2)
 
+    @clear_tracked_before
     async def process_state(self, update, context):
         """
         Универсальная обработка состояний для AddRecord.

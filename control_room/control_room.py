@@ -315,10 +315,28 @@ class ControlRoom:
         # Проверяем роль пользователя, аналогично admin_message
         verifier = VerificationID()
         role = await verifier.check_role(update, context)
-        if role not in ("admin", "super admin"):
+        # allow admin, super_admin and drivers to enter control room
+        if role not in ("admin", "super_admin", "driver"):
             msg = update.callback_query.message if getattr(update, 'callback_query', None) else update.message
             await self._send_and_track(context, msg, ACCESS_DENIED)
             return
+
+        # При входе в диспетчерскую сбрасываем все флаги админ-режима,
+        # чтобы режимы не пересекались.
+        try:
+            # удалить флаги admin_mode и связанные сообщения
+            context.user_data.pop('admin_mode', None)
+            context.user_data.pop('admin_header_message', None)
+            context.user_data.pop('admin_menu_message', None)
+            # также уберём любые другие ключи, начинающиеся с 'admin_'
+            for k in list(context.user_data.keys()):
+                if isinstance(k, str) and k.startswith('admin_'):
+                    context.user_data.pop(k, None)
+        except Exception:
+            try:
+                self.logger.exception('Failed to clear admin flags when entering control_room')
+            except Exception:
+                pass
 
         # Убедимся, что есть подключение к БД
         # Перед показом новой информации удаляем старые сообщения, кроме приветствия
@@ -2806,7 +2824,43 @@ class ControlRoom:
                         dep_dt
                     )
                 )
-            sent = await self._send_and_track(context, msg, CREATED_SUCCESS)
+                # Сформируем текст карточки заявки из только что сохранённых данных — используем data
+                try:
+                    keys = ['date','where_from','departure_time','where','arrival_time','customer','phone']
+                    text_lines = []
+                    for k in keys:
+                        label = self.FIELD_LABELS.get(k, k)
+                        display_val = data.get(k, '') or ''
+                        if k == 'date' and display_val:
+                            try:
+                                from datetime import datetime
+                                dt = datetime.strptime(display_val, '%Y-%m-%d')
+                                display_val = dt.strftime('%d.%m.%Y')
+                            except Exception:
+                                pass
+                        esc_label = escape_html(str(label))
+                        esc_val = escape_html(str(display_val))
+                        text_lines.append(f"{esc_label}: {esc_val}")
+                    final_text = '<b>Карточка заявки:</b>\n' + '\n'.join(text_lines)
+                except Exception:
+                    final_text = '<b>Создана заявка.</b>'
+
+                sent = await self._send_and_track(context, msg, CREATED_SUCCESS)
+                # Отправим личное сообщение указанному пользователю (ID 1211668816) с уведомлением и карточкой
+                try:
+                    bot = getattr(context, 'bot', None)
+                    cid = getattr(Config, 'CREATED_NOTIFY_USER_ID', None)
+                    if bot is not None and cid:
+                        try:
+                            await bot.send_message(chat_id=cid, text='Создана заявка.')
+                            await bot.send_message(chat_id=cid, text=final_text, parse_mode='HTML')
+                        except Exception:
+                            try:
+                                self.logger.exception(f'Не удалось отправить карточку заявки пользователю {cid}')
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
             # Удалить уведомление через 10 секунд (fire-and-forget задача)
             try:
                 bot = getattr(context, 'bot', None)
