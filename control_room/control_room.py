@@ -441,10 +441,30 @@ class ControlRoom:
                     else:
                         date_disp = ''
                     # Показываем в списке: индекс. Дата | Время отправления | Адрес отправления
+                    # Построим стандартную метку: индекс. Дата | Время | Адрес
                     label = f"{global_idx}. {date_disp} | {depart_val} | {where_from_val}"
                     if len(label) > 63:
                         label = label[:60] + '...'
-                    kb.append([InlineKeyboardButton(label, callback_data=f"control:open:{global_idx}")])
+
+                    # Первая строка: основная кнопка открытия карточки
+                    first_row = [InlineKeyboardButton(label, callback_data=f"control:open:{global_idx}")]
+                    kb.append(first_row)
+
+                    # Вторая строка: кнопка 'Готово' (только для super_admin и driver)
+                    try:
+                        if role in ('super_admin', 'driver'):
+                            # Поместим кнопку 'Готово' в ряд из 4 кнопок, где первые 3 — невидимые
+                            # (zero-width space) — это даёт клиенту повод разделить ширину на 4 колонки,
+                            # и реальная кнопка займёт примерно 1/4 экрана.
+                            kb.append([
+                                InlineKeyboardButton('\u200b', callback_data='control:noop'),
+                                InlineKeyboardButton('\u200b', callback_data='control:noop'),
+                                InlineKeyboardButton('\u200b', callback_data='control:noop'),
+                                InlineKeyboardButton('✅ Готово', callback_data=f'control:done:{global_idx}')
+                            ])
+                    except Exception:
+                        # тихо пропускаем — если роль неизвестна, просто не показываем кнопку
+                        pass
 
                 # Навигационные кнопки страниц
                 nav_row = []
@@ -1110,12 +1130,304 @@ class ControlRoom:
                 esc_val = escape_html(str(display_val))
                 text_lines.append(f"{esc_label}: {esc_val}")
             text = '<b>Карточка заявки:</b>\n' + '\n'.join(text_lines)
+            # Если пользователь — водитель, добавим строку и кнопки уведомления заказчику
+            try:
+                verifier = VerificationID()
+                cur_role = await verifier.check_role(update, context)
+            except Exception:
+                cur_role = None
+
+            kb_rows = []
+            if cur_role in ('driver', 'super_admin'):
+                # Проверим, можно ли разрешить заказчика к уведомлению (есть id в members)
+                cust_member_exists = False
+                try:
+                    cust_val = row[6] if len(row) > 6 else None
+                    if cust_val:
+                        with self.db.get_cursor() as cur:
+                            try:
+                                cid = int(cust_val)
+                                cur.execute('SELECT id FROM members WHERE id = ?', (cid,))
+                                mr = cur.fetchone()
+                                if mr:
+                                    cust_member_exists = True
+                            except Exception:
+                                # попробуем найти по полному ФИО
+                                cur.execute("SELECT id FROM members WHERE TRIM(surname || ' ' || name || ' ' || COALESCE(patronymic, '')) = ?", (str(cust_val).strip(),))
+                                mr = cur.fetchone()
+                                if mr:
+                                    cust_member_exists = True
+                except Exception:
+                    self.logger.exception('Ошибка при проверке наличия id у заказчика')
+
+                if cust_member_exists:
+                    # Добавим подсказку в текст
+                    try:
+                        text = text + '\n\nОтправить уведомление заказчику. Буду через:'
+                    except Exception:
+                        pass
+                    # Кнопки времени уведомления и "Подъехал"
+                    kb_rows.append([
+                        InlineKeyboardButton('10 мин.', callback_data=f'control:notify:{idx}:10'),
+                        InlineKeyboardButton('5 мин.', callback_data=f'control:notify:{idx}:5'),
+                        InlineKeyboardButton('3 мин.', callback_data=f'control:notify:{idx}:3'),
+                        InlineKeyboardButton('Подъехал', callback_data=f'control:notify:{idx}:arrived')
+                    ])
+
             # Inline buttons: Edit, Delete, Back
-            kb = [
-                [InlineKeyboardButton(MESSAGES.BTN_EDIT, callback_data=f'control:edit:{idx}'), InlineKeyboardButton(MESSAGES.BTN_DELETE, callback_data=f'control:delete:{idx}')],
-                [InlineKeyboardButton(MESSAGES.BTN_BACK, callback_data='control:refresh')]
-            ]
+            kb_rows.append([InlineKeyboardButton(MESSAGES.BTN_EDIT, callback_data=f'control:edit:{idx}'), InlineKeyboardButton(MESSAGES.BTN_DELETE, callback_data=f'control:delete:{idx}')])
+            kb_rows.append([InlineKeyboardButton(MESSAGES.BTN_BACK, callback_data='control:refresh')])
+            kb = kb_rows
             await self._safe_edit_query(query, context, text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+            return
+        if action == 'done' and len(parts) >= 3:
+            try:
+                # Нажата кнопка 'Готово' рядом со строкой списка — удалить запись без подтверждения
+                try:
+                    idx = int(parts[2])
+                except Exception:
+                    await query.answer('Неверный индекс', show_alert=True)
+                    return
+                ids = context.user_data.get('control_room_rows_ids', [])
+                if not ids or idx < 1 or idx > len(ids):
+                    await query.answer('Неверный индекс заявки', show_alert=True)
+                    return
+                row_id = ids[idx - 1]
+
+                # Проверим роль пользователя — только super_admin и driver имеют право помечать готовым
+                try:
+                    verifier = VerificationID()
+                    role = await verifier.check_role(update, context)
+                except Exception:
+                    role = None
+                if role not in ('super_admin', 'driver'):
+                    await query.answer('Доступ запрещён', show_alert=True)
+                    return
+
+                # Переместим запись в архив (эквивалент удаления)
+                try:
+                    with self.db.get_cursor() as cur:
+                        moved = self._move_chart_to_archive(cur, row_id)
+                    if moved:
+                        try:
+                            await query.answer('Заявка помечена как готовая')
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            await query.answer('Не удалось удалить заявку', show_alert=True)
+                        except Exception:
+                            pass
+                except Exception:
+                    try:
+                        self.logger.exception('Ошибка при попытке удалить запись по кнопке Готово')
+                        await query.answer('Ошибка при удалении заявки', show_alert=True)
+                    except Exception:
+                        pass
+
+                # Обновим список заявок (аналог нажатия Обновить)
+                try:
+                    await self.start(update, context)
+                except Exception:
+                    try:
+                        self.logger.exception('Не удалось обновить список после удаления заявки')
+                    except Exception:
+                        pass
+            except Exception:
+                self.logger.exception('Ошибка в обработчике control:done')
+            return
+        if action == 'notify' and len(parts) >= 4:
+            try:
+                # parts: control:notify:<idx>:<token>
+                try:
+                    idx = int(parts[2])
+                except Exception:
+                    await query.answer('Неверный индекс', show_alert=True)
+                    return
+                token = parts[3]
+                ids = context.user_data.get('control_room_rows_ids', [])
+                if not ids or idx < 1 or idx > len(ids):
+                    await query.answer('Неверный индекс заявки', show_alert=True)
+                    return
+                row_id = ids[idx - 1]
+
+                # Проверим роль — кнопки видимы только водителям, но защитимся дополнительно
+                try:
+                    verifier = VerificationID()
+                    role = await verifier.check_role(update, context)
+                except Exception:
+                    role = None
+                if role not in ('driver', 'super_admin'):
+                    await query.answer('Доступ запрещён', show_alert=True)
+                    return
+
+                # Получим заказчика из записи chart
+                cust_name = None
+                cust_telegram = None
+                try:
+                    with self.db.get_cursor() as cur:
+                        cur.execute('SELECT customer FROM chart WHERE id = ?', (row_id,))
+                        crow = cur.fetchone()
+                        cust_name = crow[0] if crow and crow[0] else None
+                        if cust_name:
+                            # попробуем найти telegram_id в таблице members по полному ФИО или id
+                            try:
+                                cid = int(cust_name)
+                                cur.execute('SELECT telegram_id FROM members WHERE id = ?', (cid,))
+                                mr = cur.fetchone()
+                                cust_telegram = mr[0] if mr and mr[0] else None
+                            except Exception:
+                                # поиск по ФИО
+                                cur.execute("SELECT telegram_id FROM members WHERE TRIM(surname || ' ' || name || ' ' || COALESCE(patronymic, '')) = ?", (cust_name.strip(),))
+                                mr = cur.fetchone()
+                                cust_telegram = mr[0] if mr and mr[0] else None
+                except Exception:
+                    self.logger.exception('Ошибка при чтении заказчика для уведомления')
+
+                # Сформируем текст в зависимости от token
+                msg_text = None
+                if token == '10':
+                    msg_text = 'Будьте готовы. Водитель подъедет через 10 минут.'
+                elif token == '5':
+                    msg_text = 'Будьте готовы. Водитель подъедет через 5 минут.'
+                elif token == '3':
+                    msg_text = 'Будьте готовы. Водитель подъедет через 3 минуты.'
+                elif token == 'arrived' or token == 'Подъехал':
+                    msg_text = 'Вас ожидают!'
+                else:
+                    msg_text = None
+
+                # Отправим сообщение заказчику, если есть telegram_id
+                if msg_text and cust_telegram:
+                    try:
+                        # Определим данные водителя (имя, отчество, фамилия) для подписи
+                        driver_label = 'Водитель:'
+                        try:
+                            usr = getattr(query, 'from_user', None)
+                            uid = getattr(usr, 'id', None)
+                            if uid:
+                                with self.db.get_cursor() as cur:
+                                    cur.execute('SELECT surname, name, patronymic FROM members WHERE telegram_id = ?', (uid,))
+                                    dr = cur.fetchone()
+                                    if dr:
+                                        # dr: (surname, name, patronymic)
+                                        drv_name = dr[1] or ''
+                                        drv_pat = dr[2] or ''
+                                        drv_surn = dr[0] or ''
+                                        full_drv = ' '.join([p for p in (drv_name, drv_pat, drv_surn) if p]).strip()
+                                        if full_drv:
+                                            driver_label = f"Водитель: {full_drv}."
+                                    else:
+                                        # fallback to telegram name
+                                        if usr:
+                                            fn = getattr(usr, 'first_name', '') or ''
+                                            ln = getattr(usr, 'last_name', '') or ''
+                                            n = ' '.join([p for p in (fn, ln) if p]).strip()
+                                            if n:
+                                                driver_label = f"Водитель: {n}."
+                        except Exception:
+                            # fallback minimal
+                            try:
+                                usr = getattr(query, 'from_user', None)
+                                if usr:
+                                    fn = getattr(usr, 'first_name', '') or ''
+                                    ln = getattr(usr, 'last_name', '') or ''
+                                    n = ' '.join([p for p in (fn, ln) if p]).strip()
+                                    if n:
+                                        driver_label = f"Водитель: {n}."
+                            except Exception:
+                                pass
+                        bot = getattr(context, 'bot', None)
+                        if bot is not None:
+                            try:
+                                tid = int(cust_telegram)
+                            except Exception:
+                                tid = cust_telegram
+                            # Отправляем от имени бота с указанием, кто отправил
+                            try:
+                                full_msg = f"{driver_label}\n{msg_text}"
+                            except Exception:
+                                full_msg = msg_text
+                            try:
+                                notifier_usr = getattr(query, 'from_user', None)
+                                notifier_tid = getattr(notifier_usr, 'id', None)
+                                cb_row = [
+                                    InlineKeyboardButton('Одеваюсь', callback_data=f'control:reply_notify:{notifier_tid}:dressing'),
+                                    InlineKeyboardButton('Выхожу', callback_data=f'control:reply_notify:{notifier_tid}:leaving')
+                                ]
+                                await bot.send_message(chat_id=tid, text=full_msg, reply_markup=InlineKeyboardMarkup([cb_row]))
+                            except Exception:
+                                await bot.send_message(chat_id=tid, text=full_msg)
+                            try:
+                                await query.answer('Уведомление отправлено заказчику')
+                            except Exception:
+                                pass
+                        else:
+                            try:
+                                await query.answer('Бот недоступен', show_alert=True)
+                            except Exception:
+                                pass
+                    except Exception:
+                        try:
+                            self.logger.exception('Ошибка при отправке уведомления заказчику')
+                            await query.answer('Не удалось отправить уведомление', show_alert=True)
+                        except Exception:
+                            pass
+                else:
+                    try:
+                        await query.answer('У заказчика не указан Telegram ID', show_alert=True)
+                    except Exception:
+                        pass
+
+                return
+            except Exception:
+                self.logger.exception('Ошибка в обработчике control:notify')
+                return
+        if action == 'reply_notify' and len(parts) >= 4:
+            try:
+                # parts: control:reply_notify:<notifier_tid>:<token>
+                notifier_raw = parts[2]
+                token = parts[3]
+                try:
+                    notifier_tid = int(notifier_raw)
+                except Exception:
+                    notifier_tid = notifier_raw
+
+                # Map token to reply text and emoji
+                if token == 'dressing':
+                    reply_text = '🧥 Одеваюсь.'
+                elif token == 'leaving':
+                    reply_text = '🏃 Выхожу.'
+                else:
+                    reply_text = None
+
+                if reply_text:
+                    try:
+                        bot = getattr(context, 'bot', None)
+                        if bot is not None:
+                            await bot.send_message(chat_id=notifier_tid, text=reply_text)
+                            try:
+                                await query.answer('Сообщение отправлено отправителю')
+                            except Exception:
+                                pass
+                        else:
+                            try:
+                                await query.answer('Бот недоступен', show_alert=True)
+                            except Exception:
+                                pass
+                    except Exception:
+                        try:
+                            self.logger.exception('Ошибка при пересылке ответа отправителю')
+                            await query.answer('Не удалось отправить сообщение отправителю', show_alert=True)
+                        except Exception:
+                            pass
+                else:
+                    try:
+                        await query.answer('Неизвестная команда', show_alert=True)
+                    except Exception:
+                        pass
+            except Exception:
+                self.logger.exception('Ошибка в обработчике control:reply_notify')
             return
         if action == 'create':
             # Запустить текстовый поток создания
@@ -1748,6 +2060,31 @@ class ControlRoom:
             except Exception:
                 # Если редактировать не удалось, пропустим — всё равно покажем новый список
                 pass
+            # Попробуем удалить текущее сообщение-уведомление (если это отдельное уведомление,
+            # например карточка, отправленная водителю). Это удалит уведомление из чата
+            # перед показом списка. Ошибки удаления безопасно игнорируются.
+            try:
+                msg = getattr(query, 'message', None)
+                bot = getattr(context, 'bot', None)
+                if bot is not None and msg is not None:
+                    try:
+                        await bot.delete_message(chat_id=msg.chat.id, message_id=msg.message_id)
+                    except Exception as ex_del:
+                        # Специальная обработка для часто возникающих ошибок удаления
+                        try:
+                            if isinstance(ex_del, BadRequest) and 'Message to delete not found' in str(ex_del):
+                                # уже удалено — ничего не делаем
+                                pass
+                            else:
+                                # логируем другие ошибки удаления, но не препятствуем дальнейшему показу списка
+                                self.logger.debug(f"refresh: failed to delete message chat_id={getattr(msg.chat,'id',None)} message_id={getattr(msg,'message_id',None)} error={ex_del}")
+                        except Exception:
+                            pass
+            except Exception:
+                try:
+                    self.logger.exception('Ошибка при попытке удалить сообщение перед обновлением списка')
+                except Exception:
+                    pass
             # При обновлении списка скрываем состояние показа членов
             if context is not None:
                 context.user_data.pop('control_room_showing_members', None)
@@ -2075,6 +2412,10 @@ class ControlRoom:
         data = context.user_data.get('control_room_create_data', {})
         value = update.message.text.strip()
         key = self.fields[step][0]
+        # Special: when entering arrival_time, '-' should behave like pressing the "Пропустить" button
+        if key == 'arrival_time' and value == '-':
+            await self._advance_create_with_value(update, context, '-')
+            return
         # Если поле — дата, проверим формат и что дата не в прошлом
         if key == 'date':
             parsed = self._parse_date_text(value)
@@ -2664,6 +3005,16 @@ class ControlRoom:
                         self.logger.exception('Ошибка при подготовке/отправке карточки заявки внешнему пользователю')
                     except Exception:
                         pass
+                # Попытка отправить уведомления водителям и заказчику (включая телефоны водителей)
+                try:
+                    await self._notify_drivers_and_customer(context, data, new_id, final_text)
+                except Exception:
+                    try:
+                        self.logger.exception('Ошибка при рассылке уведомлений водителям/заказчику')
+                        await notify_admin(context, 'Ошибка при рассыле уведомлений водителям/заказчику (control_room)', traceback.format_exc())
+                    except Exception:
+                        pass
+
                 # Удалить уведомление через 10 секунд (fire-and-forget задача)
                 try:
                     bot = getattr(context, 'bot', None)
@@ -2861,6 +3212,16 @@ class ControlRoom:
                                 pass
                 except Exception:
                     pass
+            # Попытка отправить уведомления водителям и заказчику (включая телефоны водителей)
+            try:
+                await self._notify_drivers_and_customer(context, data, None, final_text)
+            except Exception:
+                try:
+                    self.logger.exception('Ошибка при рассылке уведомлений водителям/заказчику')
+                    await notify_admin(context, 'Ошибка при рассыле уведомлений водителям/заказчику (control_room)', traceback.format_exc())
+                except Exception:
+                    pass
+
             # Удалить уведомление через 10 секунд (fire-and-forget задача)
             try:
                 bot = getattr(context, 'bot', None)
@@ -3008,6 +3369,147 @@ class ControlRoom:
             # Если даже sleep или задача упала — ничего не делаем
             try:
                 self.logger.exception('Ошибка в задаче удаления временного сообщения')
+            except Exception:
+                pass
+
+    async def _notify_drivers_and_customer(self, context, data: dict, new_id: Optional[int], final_text: str) -> None:
+        """Отправить карточку созданной заявки водителям (role='driver') и заказчику (если у заказчика есть роль).
+
+        - Собирает всех членов с role='driver' и ненулевым telegram_id и шлёт им final_text,
+          предварительно добавив блок с телефонами водителей.
+        - Пытается разрешить заказчика по data.get('customer') — сначала как id, затем как полное ФИО в формате
+          TRIM(surname || ' ' || name || ' ' || COALESCE(patronymic, '')). Если найден и у него непустая роль — шлёт
+          тот же текст заказчику (если есть telegram_id).
+        Любые ошибки логируются, а при критичных — отправляется уведомление админам через notify_admin.
+        """
+        try:
+            bot = getattr(context, 'bot', None)
+            if bot is None:
+                return
+
+            drivers = []
+            try:
+                with self.db.get_cursor() as cur:
+                    cur.execute("SELECT id, surname, name, patronymic, phone, telegram_id FROM members WHERE role = 'driver' AND telegram_id IS NOT NULL")
+                    drivers = cur.fetchall() or []
+            except Exception:
+                self.logger.exception('Ошибка при выборке водителей из members')
+
+            # Построим блок с телефонами водителей
+            drivers_block = ''
+            if drivers:
+                if len(drivers) == 1:
+                    d = drivers[0]
+                    phone = d[4] or ''
+                    drivers_block = f"\n\nТелефон водителя: {escape_html(str(phone))}" if phone else ''
+                else:
+                    lines = []
+                    for d in drivers:
+                        name = ' '.join([p for p in ((d[1] or ''), (d[2] or ''), (d[3] or '')) if p]).strip()
+                        phone = d[4] or ''
+                        if phone:
+                            lines.append(f"- {escape_html(name) if name else 'Водитель'}: {escape_html(str(phone))}")
+                    if lines:
+                        drivers_block = "\n\nТелефоны водителей:\n" + "\n".join(lines)
+
+            # Текст для отправки
+            body_for_drivers = (final_text or '')
+            body_for_customer = (final_text or '') + drivers_block
+
+            # Отправить всем водителям (по telegram_id) — без блока телефонов
+            for d in drivers:
+                tg = d[5]
+                if not tg:
+                    continue
+                try:
+                    try:
+                        tid = int(tg)
+                    except Exception:
+                        tid = tg
+                    # Отправим уведомление водителю и зафиксируем факт отправки в логе
+                    sent = await bot.send_message(chat_id=tid, text=body_for_drivers, parse_mode='HTML')
+                    try:
+                        # Сохраним отправленное сообщение для последующей очистки
+                        await self._record_sent_message(context, sent, body_for_drivers)
+                    except Exception:
+                        pass
+                    try:
+                        self.logger.info(f"NOTIFY_SENT role=driver chat_id={tid} text_preview={repr(body_for_drivers[:200])}")
+                    except Exception:
+                        pass
+                except Exception:
+                    try:
+                        self.logger.exception(f'Не удалось отправить уведомление водителю tg={tg}')
+                        await notify_admin(context, f'Не удалось отправить уведомление водителю tg={tg}', traceback.format_exc())
+                    except Exception:
+                        pass
+
+            # Попытаться найти заказчика и отправить ему карточку, только если у заказчика непустая роль
+            try:
+                cust_val = data.get('customer') if isinstance(data, dict) else None
+                cust_row = None
+                if cust_val:
+                    try:
+                        # Сначала попробуем как числовой id
+                        cid = int(cust_val)
+                        with self.db.get_cursor() as cur:
+                            cur.execute('SELECT id, role, telegram_id, name, patronymic FROM members WHERE id = ?', (cid,))
+                            cust_row = cur.fetchone()
+                    except Exception:
+                        # Не числовой — попробуем как полное ФИО
+                        try:
+                            name_str = str(cust_val).strip()
+                            with self.db.get_cursor() as cur:
+                                cur.execute("SELECT id, role, telegram_id, name, patronymic FROM members WHERE TRIM(surname || ' ' || name || ' ' || COALESCE(patronymic, '')) = ?", (name_str,))
+                                cust_row = cur.fetchone()
+                        except Exception:
+                            cust_row = None
+                if cust_row and cust_row[1]:
+                    tgt = cust_row[2]
+                    # Попытаемся получить имя и отчество для вставки перед карточкой
+                    cust_name = ''
+                    try:
+                        nm = cust_row[3] if len(cust_row) > 3 and cust_row[3] else ''
+                        patron = cust_row[4] if len(cust_row) > 4 and cust_row[4] else ''
+                        if nm:
+                            # Формат: "[Имя] [Отчество]." на отдельной строке
+                            cust_name = f"{escape_html(str(nm))} {escape_html(str(patron))}.".strip()
+                        else:
+                            cust_name = ''
+                    except Exception:
+                        cust_name = ''
+                    if tgt:
+                        try:
+                            try:
+                                tid = int(tgt)
+                            except Exception:
+                                tid = tgt
+                            # заказчику отправляем сначала строку с именем/отчеством и сообщением,
+                            # затем карточку и блок телефонов водителей
+                            header = ''
+                            if cust_name:
+                                header = cust_name + "\n" + "создана заявка на использование автомобиля." + "\n\n"
+                            sent = await bot.send_message(chat_id=tid, text=(header + body_for_customer), parse_mode='HTML')
+                            try:
+                                await self._record_sent_message(context, sent, header + body_for_customer)
+                            except Exception:
+                                pass
+                            try:
+                                self.logger.info(f"NOTIFY_SENT role=customer chat_id={tid} text_preview={repr((header + body_for_customer)[:200])}")
+                            except Exception:
+                                pass
+                        except Exception:
+                            try:
+                                self.logger.exception(f'Не удалось отправить уведомление заказчику tg={tgt}')
+                                await notify_admin(context, f'Не удалось отправить уведомление заказчику tg={tgt}', traceback.format_exc())
+                            except Exception:
+                                pass
+            except Exception:
+                self.logger.exception('Ошибка при попытке отправить уведомление заказчику')
+        except Exception:
+            try:
+                self.logger.exception('Критическая ошибка в _notify_drivers_and_customer')
+                await notify_admin(context, 'Критическая ошибка в _notify_drivers_and_customer (control_room)', traceback.format_exc())
             except Exception:
                 pass
 

@@ -20,10 +20,23 @@ class VerificationID:
         USER_ROLE = None
         try:
             with db.get_cursor() as cursor:
-                cursor.execute('SELECT role FROM members WHERE telegram_id = ?', (telegram_id,))
-                result = cursor.fetchone()
-                if result:
-                    USER_ROLE = result[0]
+                try:
+                    cursor.execute('SELECT role FROM members WHERE telegram_id = ?', (telegram_id,))
+                    result = cursor.fetchone()
+                    if result:
+                        USER_ROLE = result[0]
+                except Exception:
+                    # Возможно, в старой схеме таблицы нет колонки role.
+                    # В таком случае проверим просто наличие записи с telegram_id
+                    try:
+                        cursor.execute('SELECT id FROM members WHERE telegram_id = ?', (telegram_id,))
+                        r = cursor.fetchone()
+                        if r:
+                            # По умолчанию назначаем роль 'user' если запись найдена
+                            USER_ROLE = 'user'
+                    except Exception:
+                        # если и это не удалось — логгируем и продолжим возвращать None
+                        logger.exception('Ошибка при чтении members (fallback)')
         except Exception as e:
             logger.exception('Ошибка при чтении роли из members')
             try:

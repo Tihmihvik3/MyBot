@@ -105,7 +105,63 @@ async def start_command(update, context):
     msg_obj = update.message if getattr(update, 'message', None) else (update.callback_query.message if getattr(update, 'callback_query', None) else None)
     greeting_text = "Добро пожаловать! Я бот Анжеро-Судженской МО ВОС. Чем могу помочь?"
     if msg_obj is not None:
-        await msg_obj.reply_text(greeting_text, reply_markup=kb)
+        # Перед отправкой проверим, не занесён ли пользователь в блок-лист
+        try:
+            user_id = update.message.from_user.id if getattr(update, 'message', None) and getattr(update.message, 'from_user', None) else (getattr(update.callback_query, 'from_user', None).id if getattr(update, 'callback_query', None) and getattr(update.callback_query_from_user, 'id', None) else None)
+        except Exception:
+            # Fallback safe attempt
+            try:
+                user_id = update.effective_user.id if getattr(update, 'effective_user', None) else None
+            except Exception:
+                user_id = None
+        try:
+            from db.database import Database
+            db = Database()
+            with db.get_cursor() as cursor:
+                # Создадим таблицу blocking_user если её нет
+                try:
+                    cursor.execute('CREATE TABLE IF NOT EXISTS blocking_user (id INTEGER PRIMARY KEY AUTOINCREMENT, telegram_id INTEGER UNIQUE)')
+                except Exception:
+                    pass
+                if user_id is not None:
+                    cursor.execute('SELECT telegram_id FROM blocking_user WHERE telegram_id = ?', (user_id,))
+                    if cursor.fetchone():
+                        # Пользователь заблокирован
+                        try:
+                            await msg_obj.reply_text('Вы заблокированы. Обратитесь к администратору бота.')
+                        except Exception:
+                            try:
+                                await context.bot.send_message(chat_id=user_id, text='Вы заблокированы. Обратитесь к администратору бота.')
+                            except Exception:
+                                pass
+                        context.user_data['blocked'] = True
+                        return
+        except Exception:
+            try:
+                logging.exception('start_command: failed to check blocking_user table')
+            except Exception:
+                pass
+
+        # Проверим роль пользователя — если роль отсутствует или не в списке, предложим регистрацию
+        try:
+            from verification_id import VerificationID
+            verifier = VerificationID()
+            role = await verifier.check_role(update, context)
+        except Exception:
+            role = None
+
+        allowed_roles = ('super_admin', 'admin', 'driver', 'user')
+        if role in allowed_roles:
+            await msg_obj.reply_text(greeting_text, reply_markup=kb)
+        else:
+            # Предложим зарегистрироваться
+            try:
+                # Используем уже импортированные InlineKeyboardButton/InlineKeyboardMarkup
+                kb_reg = InlineKeyboardMarkup([[InlineKeyboardButton('Регистрация в боте', callback_data='register:start')]])
+                await msg_obj.reply_text('Вам необходимо зарегистрироваться, чтобы продолжить.', reply_markup=kb_reg)
+            except Exception:
+                await msg_obj.reply_text('Вам необходимо зарегистрироваться, чтобы продолжить. Отправьте команду /register')
+        return
     else:
         # fallback: отправка через bot.send_message, если можно определить чат
         chat_id = update.effective_chat.id if getattr(update, 'effective_chat', None) else None
@@ -461,6 +517,18 @@ async def admin_action_handler(update, context):
         logging.info(f"admin_action_handler entered; message_text={(update.message.text if getattr(update, 'message', None) else None)!r}; admin_mode={context.user_data.get('admin_mode')}")
     except Exception:
         logging.exception('admin_action_handler: error logging entry state')
+
+    # Если пользователь в процессе регистрации — обработаем ввод номера членского билета
+    try:
+        if context.user_data.get('awaiting_registration_ticket'):
+            processed = await _handle_registration_ticket(update, context)
+            if processed:
+                return
+    except Exception:
+        try:
+            logging.exception('admin_action_handler: registration ticket handler failed')
+        except Exception:
+            pass
 
     # --- Делегируем обработку состояния ControlRoom ---
     from control_room.control_room import ControlRoom
@@ -1073,6 +1141,172 @@ async def search_callback(update, context):
     return
 
 
+@clear_tracked_before
+async def register_callback(update, context):
+    """Обработка нажатия inline-кнопки 'Регистрация в боте'"""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    # Удалим старое сообщение с кнопкой
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+    # Инициализируем режим регистрации
+    context.user_data['register_attempts'] = 1
+    context.user_data['awaiting_registration_ticket'] = True
+    # Отправим приглашение в чат
+    try:
+        chat_id = query.from_user.id if getattr(query, 'from_user', None) and getattr(query.from_user, 'id', None) else None
+        text = 'Введите номер вашего членского билета (у вас 3 попытки):\nПопытка №1:'
+        if chat_id:
+            sent = await context.bot.send_message(chat_id=chat_id, text=text)
+            # Сохраним сообщение, чтобы можно было удалить позже
+            try:
+                lst = context.user_data.get('admin_sent_messages', [])
+                lst.append({'chat_id': sent.chat.id, 'message_id': sent.message_id, 'text': text})
+                context.user_data['admin_sent_messages'] = lst
+            except Exception:
+                pass
+        else:
+            await query.message.reply_text(text)
+    except Exception:
+        try:
+            await query.message.reply_text('Введите номер вашего членского билета (у вас 3 попытки):\nПопытка №1:')
+        except Exception:
+            pass
+    return
+
+
+async def _handle_registration_ticket(update, context):
+    """Обработка введённого номера членского билета при регистрации.
+
+    Возвращает True если сообщение обработано регистрацией (и должно быть остановлено дальнейшее обработка).
+    """
+    if not context.user_data.get('awaiting_registration_ticket'):
+        return False
+    ticket = update.message.text.strip() if getattr(update, 'message', None) and getattr(update.message, 'text', None) else ''
+    user_id = update.message.from_user.id if getattr(update, 'message', None) and getattr(update.message.from_user, 'id', None) else None
+    from db.database import Database
+    db = Database()
+    try:
+        with db.get_cursor() as cursor:
+            # Проверим наличие записи с таким ticket_number
+            cursor.execute('SELECT id FROM members WHERE ticket_number = ?', (ticket,))
+            row = cursor.fetchone()
+            if row:
+                member_id = row[0]
+                try:
+                    cursor.execute('UPDATE members SET telegram_id = ?, role = ? WHERE id = ?', (user_id, 'user', member_id))
+                except Exception:
+                    # Попробуем обновить только telegram_id, если роль поле отсутствует
+                    try:
+                        cursor.execute('UPDATE members SET telegram_id = ? WHERE id = ?', (user_id, member_id))
+                    except Exception:
+                        pass
+                # Успех регистрации — удалим трекнутые сообщения и продолжим работу
+                try:
+                    from utils.admin_messenger import delete_tracked_messages
+                    await delete_tracked_messages(context, exclude_greeting=True)
+                except Exception:
+                    pass
+                # Сбросим флаги регистрации
+                context.user_data.pop('awaiting_registration_ticket', None)
+                context.user_data.pop('register_attempts', None)
+                # Повторно проверим роль и продолжим (вызовем start_command)
+                try:
+                    # Отправим явное подтверждение регистрации пользователю.
+                    if user_id is not None:
+                        await context.bot.send_message(chat_id=user_id, text='Регистрация выполнена. Можете продолжать.')
+                    else:
+                        await update.message.reply_text('Регистрация выполнена. Можете продолжать.')
+                except Exception:
+                    try:
+                        await update.message.reply_text('Регистрация выполнена. Можете продолжать.')
+                    except Exception:
+                        pass
+
+                # Отправим приветствие (как в start_command), но не вызывая
+                # start_command напрямую — чтобы избежать дублирования логики
+                # и возможных гонок с контекстом update.
+                try:
+                    from verification_id import VerificationID
+                    verifier = VerificationID()
+                    try:
+                        role = await verifier.check_role(update, context)
+                    except Exception:
+                        role = None
+                except Exception:
+                    role = None
+
+                try:
+                    rows = [[InlineKeyboardButton(MESSAGES_ADMIN.BTN_MENU, callback_data='menu:show'), InlineKeyboardButton(MESSAGES_ADMIN.BTN_HELP, callback_data='help:show')]]
+                    if role == 'super_admin':
+                        rows.append([InlineKeyboardButton(MESSAGES_ADMIN.BTN_MENU_TOGGLE, callback_data='dropdown:toggle')])
+                    kb = InlineKeyboardMarkup(rows)
+                    greeting_text = "Добро пожаловать! Я бот Анжеро-Судженской МО ВОС. Чем могу помочь?"
+                    if user_id is not None:
+                        await context.bot.send_message(chat_id=user_id, text=greeting_text, reply_markup=kb)
+                    else:
+                        try:
+                            await update.message.reply_text(greeting_text, reply_markup=kb)
+                        except Exception:
+                            # fallback: try to send via bot if reply_text fails
+                            if getattr(context, 'bot', None) and getattr(update, 'effective_user', None):
+                                await context.bot.send_message(chat_id=update.effective_user.id, text=greeting_text, reply_markup=kb)
+                except Exception:
+                    try:
+                        logging.exception('Failed to send greeting after registration')
+                    except Exception:
+                        pass
+                return True
+            else:
+                # Не найдено — увеличим счётчик попыток
+                attempts = context.user_data.get('register_attempts', 1)
+                attempts += 1
+                context.user_data['register_attempts'] = attempts
+                if attempts <= 3:
+                    # Сообщим о неудаче и попросим ввести снова
+                    try:
+                        await update.message.reply_text('Таких данных не существует.\nПопытка №{}:'.format(attempts))
+                    except Exception:
+                        pass
+                    return True
+                else:
+                    # Третья попытка неудачна — блокируем пользователя
+                    try:
+                        from utils.admin_messenger import delete_tracked_messages
+                        await delete_tracked_messages(context, exclude_greeting=True)
+                    except Exception:
+                        pass
+                    try:
+                        # Создадим таблицу blocking_user если её нет и добавим telegram_id
+                        cursor.execute('CREATE TABLE IF NOT EXISTS blocking_user (id INTEGER PRIMARY KEY AUTOINCREMENT, telegram_id INTEGER UNIQUE)')
+                        if user_id is not None:
+                            try:
+                                cursor.execute('INSERT OR IGNORE INTO blocking_user (telegram_id) VALUES (?)', (user_id,))
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    try:
+                        await update.message.reply_text('Вы заблокированы. Обратитесь к администратору бота.')
+                    except Exception:
+                        pass
+                    context.user_data['blocked'] = True
+                    context.user_data.pop('awaiting_registration_ticket', None)
+                    context.user_data.pop('register_attempts', None)
+                    return True
+    except Exception:
+        try:
+            logging.exception('_handle_registration_ticket: db error')
+        except Exception:
+            pass
+    return False
+
+
 
 @clear_tracked_before
 async def control_entry(update, context):
@@ -1108,7 +1342,38 @@ async def number_message(update, context):
 
 def main():
     # Создаем экземпляр приложения
-    application = Application.builder().token(settings.API_KEY).build()
+    # Пост-инит регистратор джобов, чтобы job_queue уже существовал
+    async def _register_jobs(app):
+        try:
+            from zoneinfo import ZoneInfo
+            from datetime import time as _time
+            tz = ZoneInfo(getattr(settings, 'TIMEZONE', 'Europe/Moscow'))
+
+            async def _birthday_job(context):
+                days = None
+                try:
+                    days = context.job.data.get('days') if context.job and getattr(context.job, 'data', None) else None
+                except Exception:
+                    days = None
+                if days is None:
+                    days = 0
+                try:
+                    from db.notifications import send_birthday_notifications
+                    sent = await send_birthday_notifications(context.bot, int(days))
+                    logging.info(f"birthday_job(days={days}) attempted sends={sent}")
+                except Exception:
+                    logging.exception('birthday_job failed')
+
+            jq = getattr(app, 'job_queue', None)
+            if jq:
+                jq.run_daily(_birthday_job, time=_time(9, 10, tzinfo=tz), name='birthday_3d', data={'days': 3})
+                jq.run_daily(_birthday_job, time=_time(9, 10, tzinfo=tz), name='birthday_0d', data={'days': 0})
+            else:
+                logging.warning('Job queue is not available on Application instance in post_init; skipping daily birthday jobs registration')
+        except Exception:
+            logging.exception('Failed to register birthday jobs (post_init)')
+
+    application = Application.builder().token(settings.API_KEY).post_init(_register_jobs).build()
 
     # Добавляем обработчик команды /start
     application.add_handler(CommandHandler("start", start_command))
@@ -1162,6 +1427,8 @@ def main():
     application.add_handler(CallbackQueryHandler(inline_menu_callback, pattern=r'^inline_menu:'))
     # CallbackQuery для поиска (cancel)
     application.add_handler(CallbackQueryHandler(search_callback, pattern=r'^search:'))
+    # CallbackQuery для регистрации (кнопка 'Регистрация в боте')
+    application.add_handler(CallbackQueryHandler(register_callback, pattern=r'^register:'))
     # Обработчик для сообщения '?' чтобы показать справку
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'(?i)^\s*\?\s*$'), help_message))
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'(?i)новости'), news_message))
@@ -1177,39 +1444,7 @@ def main():
 
     logging.info("Бот стартовал")
 
-    # Register daily birthday notifier jobs (09:10 local time)
-    try:
-        from zoneinfo import ZoneInfo
-        from datetime import time as _time
-        tz = ZoneInfo(getattr(settings, 'TIMEZONE', 'Europe/Moscow'))
-
-        async def _birthday_job(context):
-            # context.job.data expected to contain {'days': int}
-            days = None
-            try:
-                days = context.job.data.get('days') if context.job and getattr(context.job, 'data', None) else None
-            except Exception:
-                days = None
-            if days is None:
-                days = 0
-            try:
-                from db.notifications import send_birthday_notifications
-                sent = await send_birthday_notifications(context.bot, int(days))
-                logging.info(f"birthday_job(days={days}) attempted sends={sent}")
-            except Exception:
-                logging.exception('birthday_job failed')
-
-        # Register jobs only if job_queue is available on the application object
-        jq = getattr(application, 'job_queue', None)
-        if jq:
-            # at 09:10 send reminder for 3 days before
-            jq.run_daily(_birthday_job, time=_time(9, 10, tzinfo=tz), name='birthday_3d', data={'days': 3})
-            # at 09:10 send reminder on the birthday
-            jq.run_daily(_birthday_job, time=_time(9, 10, tzinfo=tz), name='birthday_0d', data={'days': 0})
-        else:
-            logging.warning('Job queue is not available on Application instance; skipping daily birthday jobs registration')
-    except Exception:
-        logging.exception('Failed to register birthday jobs')
+    # Register daily birthday notifier jobs via post_init (see _register_jobs)
 
     # Запускаем бота
     application.run_polling()
